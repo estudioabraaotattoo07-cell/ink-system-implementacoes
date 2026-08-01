@@ -19,5 +19,11 @@ substitui, só orienta quem abre o repositório pela primeira vez.
 
 ## Estado atual
 
-Fundação (Bloco 4.7) — sem nenhuma funcionalidade de negócio ainda. Só
-conexão com o Supabase, autenticação e a rota `/api/health`.
+Fundação (Bloco 4.7) + renderizador do "Meu Site" (Bloco 4.8), migrado de
+`inq-saas`: `lib/site-publico/` e as rotas `/api/meu-site` e
+`/api/meu-site/preview` — ainda sem tráfego real apontado pra cá (religação
+é o Bloco 4.9). Conexão com o Supabase, autenticação e a rota `/api/health`
+seguem da fundação.
+
+Deploy: conectado ao GitHub (Bloco 4.9A) — todo push em `main` gera deploy
+automático de produção na Vercel. Não usar `vercel --prod` manualmente.
