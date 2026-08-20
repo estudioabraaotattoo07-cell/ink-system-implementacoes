@@ -1,11 +1,13 @@
 import { createClient } from "@supabase/supabase-js";
 
-// Cliente só para validar token de sessão (auth.getUser) -- não é o cliente
-// de dados, não usa cookies. Mesmo padrão de inq-saas/api/_lib/auth.js.
-const sbAuth = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
+// Criado somente quando chega uma requisição. Assim, uma variável ausente não
+// derruba o build inteiro; a autenticação falha de forma segura em tempo de uso.
+function criarClienteAuth() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!url || !anonKey) return null;
+  return createClient(url, anonKey);
+}
 
 export type ResultadoAutenticacao =
   | { ok: true; tipo: "user"; userId: string; email: string; identificador: string }
@@ -37,6 +39,8 @@ export async function autenticarChamador(req: Request): Promise<ResultadoAutenti
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
   if (token) {
     try {
+      const sbAuth = criarClienteAuth();
+      if (!sbAuth) return { ok: false };
       const { data, error } = await sbAuth.auth.getUser(token);
       if (!error && data?.user) {
         return { ok: true, tipo: "user", userId: data.user.id, email: data.user.email || "", identificador: `user:${data.user.id}` };
