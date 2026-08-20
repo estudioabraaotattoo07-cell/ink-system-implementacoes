@@ -8,7 +8,7 @@ const sbAuth = createClient(
 );
 
 export type ResultadoAutenticacao =
-  | { ok: true; tipo: "user"; userId: string }
+  | { ok: true; tipo: "user"; userId: string; email: string; identificador: string }
   | { ok: true; tipo: "service"; identificador: string }
   | { ok: false };
 
@@ -39,7 +39,7 @@ export async function autenticarChamador(req: Request): Promise<ResultadoAutenti
     try {
       const { data, error } = await sbAuth.auth.getUser(token);
       if (!error && data?.user) {
-        return { ok: true, tipo: "user", userId: data.user.id };
+        return { ok: true, tipo: "user", userId: data.user.id, email: data.user.email || "", identificador: `user:${data.user.id}` };
       }
     } catch (e) {
       console.error("validação de sessão falhou:", e);
