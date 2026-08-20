@@ -13,7 +13,6 @@ revoke all on public.integracoes_credenciais from public, anon, authenticated;
 grant select, insert, update, delete on public.integracoes_credenciais to service_role;
 comment on table public.integracoes_credenciais is 'Credenciais BYOK cifradas; acesso exclusivo do ink-system-implementacoes.';
 
-alter table public.configuracoes drop column if exists resend_api_key;
-alter table public.configuracoes drop column if exists aura_api_key;
-alter table public.configuracoes drop column if exists zenvia_api_key;
-alter table public.configuracoes drop column if exists zenvia_numero;
+-- As colunas antigas não são removidas nesta primeira etapa. Elas podem conter
+-- credenciais ainda em uso e só devem ser apagadas depois que cada proprietário
+-- recadastrar suas integrações no novo cofre cifrado.
