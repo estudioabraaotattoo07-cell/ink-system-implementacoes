@@ -10,7 +10,14 @@ export const ORIGENS_CRM = [
 const OWNER_EMAIL = "estudioabraaotattoo07@gmail.com";
 
 export function origemPermitida(req: Request) {
-  return ORIGENS_CRM.includes(req.headers.get("origin") || "");
+  const origem = req.headers.get("origin") || "";
+  if (ORIGENS_CRM.includes(origem)) return true;
+  try {
+    const host = new URL(origem).hostname;
+    return /^inq-saas-[a-z0-9-]+-estudioabraaotattoo07-cells-projects\.vercel\.app$/i.test(host);
+  } catch {
+    return false;
+  }
 }
 
 export async function usuarioTemAcessoCrm(sb: SupabaseClient, auth: { userId: string; email: string }) {
@@ -21,7 +28,7 @@ export async function usuarioTemAcessoCrm(sb: SupabaseClient, auth: { userId: st
 }
 
 export function respostaCors(resposta: Response, origem: string) {
-  if (ORIGENS_CRM.includes(origem)) resposta.headers.set("Access-Control-Allow-Origin", origem);
+  if (origemPermitida(new Request("https://interno.invalid", { headers: { origin: origem } }))) resposta.headers.set("Access-Control-Allow-Origin", origem);
   resposta.headers.set("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, OPTIONS");
   resposta.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Implementacoes-Service-Key");
   resposta.headers.set("Vary", "Origin");
