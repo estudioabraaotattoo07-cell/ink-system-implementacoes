@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { criptografarCredencial } from "@/lib/integracoes/credenciais";
+import { criptografarCredencial, descriptografarCredencial } from "@/lib/integracoes/credenciais";
 
 // Integração Meta WhatsApp — Fase 2 (backend do Embedded Signup).
 //
@@ -67,10 +67,16 @@ export function validarPedido(body: unknown): PedidoConexao | null {
 // Nunca registrar URL, cabeçalho ou corpo destas chamadas: carregam o App
 // Secret e o token do cliente. Erros viram só um código curto.
 
-async function chamarGraph(buscar: Busca, url: string, token?: string) {
+async function chamarGraph(buscar: Busca, url: string, token?: string, envio?: { metodo: "POST"; corpo?: unknown }) {
   try {
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    if (envio?.corpo !== undefined) headers["Content-Type"] = "application/json";
     const resposta = await buscar(url, {
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      method: envio?.metodo ?? "GET",
+      headers,
+      // corpo (ex.: PIN do registro) nunca vai na URL
+      body: envio?.corpo !== undefined ? JSON.stringify(envio.corpo) : undefined,
       signal: AbortSignal.timeout(TIMEOUT_META_MS),
       cache: "no-store",
     });
@@ -141,10 +147,11 @@ export async function confirmarTelefone(config: ConfigMeta, accessToken: string,
 type Linha = {
   user_id: string; waba_id: string | null; phone_number_id: string | null; business_id: string | null;
   display_phone_number: string | null; status: string; webhook_inscrito_em: string | null;
+  webhook_ultimo_evento_em: string | null; registro_ultima_falha_em: string | null;
   conectado_em: string | null; ultimo_erro: string | null; token_expira_em: string | null; atualizado_em: string;
 };
 
-const COLUNAS = "user_id,waba_id,phone_number_id,business_id,display_phone_number,status,webhook_inscrito_em,conectado_em,ultimo_erro,token_expira_em,atualizado_em";
+const COLUNAS = "user_id,waba_id,phone_number_id,business_id,display_phone_number,status,webhook_inscrito_em,webhook_ultimo_evento_em,registro_ultima_falha_em,conectado_em,ultimo_erro,token_expira_em,atualizado_em";
 
 async function lerLinha(sb: SupabaseClient, userId: string): Promise<Linha | null> {
   const { data, error } = await sb.from("integracoes_whatsapp").select(COLUNAS).eq("user_id", userId).maybeSingle();
@@ -233,6 +240,8 @@ export async function conectarWhatsapp({ sb, userId, pedido, config, buscar = fe
       status: "conectando",
       conectado_em: null,
       webhook_inscrito_em: null,
+      webhook_ultimo_evento_em: null,
+      registro_ultima_falha_em: null,
       ultimo_erro: null,
       token_expira_em: tokenExpiraEm,
     }).eq("user_id", userId).select("user_id");
@@ -275,7 +284,8 @@ export async function conectarWhatsapp({ sb, userId, pedido, config, buscar = fe
       ? {
           waba_id: anterior!.waba_id, phone_number_id: anterior!.phone_number_id, business_id: anterior!.business_id,
           display_phone_number: anterior!.display_phone_number, status: anterior!.status,
-          webhook_inscrito_em: anterior!.webhook_inscrito_em, conectado_em: anterior!.conectado_em,
+          webhook_inscrito_em: anterior!.webhook_inscrito_em, webhook_ultimo_evento_em: anterior!.webhook_ultimo_evento_em,
+          registro_ultima_falha_em: anterior!.registro_ultima_falha_em, conectado_em: anterior!.conectado_em,
           ultimo_erro: anterior!.ultimo_erro, token_expira_em: anterior!.token_expira_em,
         }
       : { status: "erro", ultimo_erro: falha.codigo.slice(0, 500) };
@@ -285,8 +295,8 @@ export async function conectarWhatsapp({ sb, userId, pedido, config, buscar = fe
 }
 
 // Estado para a tela. Nunca devolve token. 'conectado' só quando o status é
-// 'conectado' E o token existe no cofre -- nesta fase o status para em
-// 'conectando', então conectado é sempre false.
+// 'conectado' (promovido pela ativação, Fase 3) E o token existe no cofre;
+// enquanto 'conectando', conectado é false.
 export async function estadoWhatsapp(sb: SupabaseClient, userId: string) {
   const linha = await lerLinha(sb, userId);
   if (!linha) return { habilitado: true, conectado: false, status: null };
@@ -301,8 +311,162 @@ export async function estadoWhatsapp(sb: SupabaseClient, userId: string) {
     display_phone_number: linha.display_phone_number,
     conectado_em: linha.conectado_em,
     webhook_inscrito_em: linha.webhook_inscrito_em,
+    webhook_ultimo_evento_em: linha.webhook_ultimo_evento_em,
     token_expira_em: linha.token_expira_em,
     ultimo_erro: linha.ultimo_erro,
     atualizado_em: linha.atualizado_em,
   };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fase 3 — ativação: inscrição da WABA no webhook, registro do número e
+// promoção 'conectando' -> 'conectado'.
+//
+// Referências (Graph API v26.0, conferidas em 2026-09-28):
+//   POST/GET /{waba_id}/subscribed_apps   (success / whatsapp_business_api_data.id)
+//   GET  /{phone_number_id}?fields=status  (operacional = "CONNECTED")
+//   POST /{phone_number_id}/register {messaging_product, pin}  (10 por 72 h; 133016)
+// platform_type NÃO é usado: não consta na documentação atual (On-Premises
+// foi desligado em 23/10/2025).
+// ═══════════════════════════════════════════════════════════════════════════
+
+const STATUS_OPERACIONAL = "CONNECTED";
+const ESPERA_APOS_FALHA_REGISTRO_MS = 10 * 60 * 1000;
+
+// PIN opcional: ausente = null; presente precisa ter exatamente 6 dígitos.
+export function validarPedidoAtivacao(body: unknown): { pin: string | null } | null {
+  if (body == null) return { pin: null };
+  if (typeof body !== "object") return null;
+  const { pin } = body as Record<string, unknown>;
+  if (pin === undefined || pin === null || pin === "") return { pin: null };
+  if (typeof pin !== "string" || !/^[0-9]{6}$/.test(pin)) return null;
+  return { pin };
+}
+
+async function lerTokenDoCofre(sb: SupabaseClient, userId: string) {
+  const credencial = await lerCredencial(sb, userId);
+  if (!credencial) throw new ErroConexao("credencial_ausente", 409);
+  try {
+    const token = JSON.parse(descriptografarCredencial(credencial.credencial_cifrada))?.access_token;
+    if (typeof token !== "string" || !token) throw new Error();
+    return token as string;
+  } catch {
+    throw new ErroConexao("credencial_invalida", 500);
+  }
+}
+
+export async function inscreverApp(config: ConfigMeta, accessToken: string, wabaId: string, buscar: Busca) {
+  const url = `https://graph.facebook.com/${config.versao}/${wabaId}/subscribed_apps`;
+  const { ok, json } = await chamarGraph(buscar, url, accessToken, { metodo: "POST" });
+  if (!ok || json?.success !== true) throw new ErroConexao(`meta_subscribe:${codigoMeta(json)}`, 502);
+}
+
+// O success do POST não basta: o nosso app precisa aparecer na lista.
+export async function confirmarInscricao(config: ConfigMeta, accessToken: string, wabaId: string, buscar: Busca) {
+  const url = `https://graph.facebook.com/${config.versao}/${wabaId}/subscribed_apps`;
+  const { ok, json } = await chamarGraph(buscar, url, accessToken);
+  if (!ok || !Array.isArray(json?.data)) throw new ErroConexao(`meta_subscribed_apps:${codigoMeta(json)}`, 502);
+  const inscrito = json.data.some((a: any) => String(a?.whatsapp_business_api_data?.id) === config.appId);
+  if (!inscrito) throw new ErroConexao("inscricao_nao_confirmada", 502);
+}
+
+export async function consultarStatusNumero(config: ConfigMeta, accessToken: string, phoneNumberId: string, buscar: Busca) {
+  const url = new URL(`https://graph.facebook.com/${config.versao}/${phoneNumberId}`);
+  url.searchParams.set("fields", "status");
+  const { ok, json } = await chamarGraph(buscar, url.toString(), accessToken);
+  if (!ok || typeof json?.status !== "string") throw new ErroConexao(`meta_numero:${codigoMeta(json)}`, 502);
+  return json.status as string;
+}
+
+// O PIN vai só no corpo, nunca em URL, log, erro ou resposta.
+export async function registrarNumero(config: ConfigMeta, accessToken: string, phoneNumberId: string, pin: string, buscar: Busca) {
+  const url = `https://graph.facebook.com/${config.versao}/${phoneNumberId}/register`;
+  const { ok, json } = await chamarGraph(buscar, url, accessToken, { metodo: "POST", corpo: { messaging_product: "whatsapp", pin } });
+  if (!ok || json?.success !== true) {
+    const codigo = codigoMeta(json);
+    throw new ErroConexao(`registro_numero:${codigo}`, codigo === "133016" ? 429 : 502);
+  }
+}
+
+export type DependenciasAtivacao = {
+  sb: SupabaseClient;
+  userId: string;
+  pin: string | null;
+  config: ConfigMeta;
+  buscar?: Busca;
+  agora?: () => Date;
+};
+
+export async function ativarWhatsapp({ sb, userId, pin, config, buscar = fetch, agora = () => new Date() }: DependenciasAtivacao) {
+  // Só atua sobre 'conectando' com IDs: nunca rebaixa nem toca 'conectado'
+  // ou 'erro' (409 sem nenhuma chamada à Meta e sem escrita).
+  const linha = await lerLinha(sb, userId);
+  if (!linha || linha.status !== "conectando" || !linha.waba_id || !linha.phone_number_id) {
+    throw new ErroConexao("estado_invalido", 409);
+  }
+  const wabaId = linha.waba_id;
+  const phoneNumberId = linha.phone_number_id;
+  // Toda escrita da ativação é condicionada à MESMA conexão: se uma
+  // reconexão trocar os IDs ou o status no meio, nada é gravado.
+  const atualizar = (valores: Record<string, unknown>) => sb.from("integracoes_whatsapp").update(valores)
+    .eq("user_id", userId).eq("status", "conectando").eq("waba_id", wabaId).eq("phone_number_id", phoneNumberId)
+    .select("user_id");
+
+  try {
+    const token = await lerTokenDoCofre(sb, userId);
+    await validarToken(config, token, wabaId, buscar);
+
+    await inscreverApp(config, token, wabaId, buscar);
+    await confirmarInscricao(config, token, wabaId, buscar);
+    const inscritoEm = agora().toISOString();
+    const { data: inscricao, error: erroInscricao } = await atualizar({ webhook_inscrito_em: inscritoEm });
+    if (erroInscricao) throw new ErroConexao("falha_interna", 500);
+    if (!umaLinha(inscricao)) throw new ErroConexao("estado_alterado", 409);
+
+    let statusNumero = await consultarStatusNumero(config, token, phoneNumberId, buscar);
+    if (statusNumero !== STATUS_OPERACIONAL) {
+      if (!pin) throw new ErroConexao("pin_necessario", 409);
+      // Protege o limite da Meta (10 registros por 72 h): depois de uma falha
+      // de registro, nova tentativa só após 10 minutos. O relógio é
+      // EXCLUSIVAMENTE registro_ultima_falha_em -- nunca atualizado_em, que o
+      // gatilho renova em qualquer UPDATE (inscrição, sinal de vida...).
+      const ultimaFalha = Date.parse(String(linha.registro_ultima_falha_em ?? ""));
+      if (Number.isFinite(ultimaFalha) && agora().getTime() - ultimaFalha < ESPERA_APOS_FALHA_REGISTRO_MS) {
+        throw new ErroConexao("aguarde_registro", 429);
+      }
+      await registrarNumero(config, token, phoneNumberId, pin, buscar);
+      statusNumero = await consultarStatusNumero(config, token, phoneNumberId, buscar);
+      if (statusNumero !== STATUS_OPERACIONAL) throw new ErroConexao("numero_nao_conectado", 502);
+    }
+
+    // Promoção: condicional à mesma conexão, exatamente 1 linha.
+    const conectadoEm = agora().toISOString();
+    const { data: promovida, error: erroPromocao } = await atualizar({
+      status: "conectado", conectado_em: conectadoEm, ultimo_erro: null, registro_ultima_falha_em: null,
+    });
+    if (erroPromocao) throw new ErroConexao("falha_interna", 500);
+    if (!umaLinha(promovida)) throw new ErroConexao("estado_alterado", 409);
+
+    return {
+      status: "conectado" as const,
+      waba_id: wabaId,
+      phone_number_id: phoneNumberId,
+      webhook_inscrito_em: inscritoEm,
+      conectado_em: conectadoEm,
+    };
+  } catch (erro) {
+    const falha = erro instanceof ErroConexao ? erro : new ErroConexao("falha_interna", 500);
+    // A linha continua 'conectando'; só o ultimo_erro registra o motivo, e só
+    // se ainda for a mesma conexão (nunca escreve sobre uma reconexão).
+    // pin_necessario e aguarde_registro são pedidos de ação, não falhas: não
+    // são gravados. Falha do POST /register também grava o relógio da espera.
+    if (!["estado_alterado", "pin_necessario", "aguarde_registro"].includes(falha.codigo)) {
+      const falhaDeRegistro = falha.codigo.startsWith("registro_numero:");
+      await atualizar({
+        ultimo_erro: falha.codigo.slice(0, 500),
+        ...(falhaDeRegistro ? { registro_ultima_falha_em: agora().toISOString() } : {}),
+      });
+    }
+    throw falha;
+  }
 }

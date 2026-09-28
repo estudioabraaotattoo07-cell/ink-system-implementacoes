@@ -25,5 +25,15 @@ export async function resolve(specifier, context, nextResolve) {
     const target = resolverComExtensao(new URL(specifier.slice(2), ROOT).href);
     return nextResolve(target, context);
   }
-  return nextResolve(specifier, context);
+  try {
+    return await nextResolve(specifier, context);
+  } catch (erro) {
+    // Subcaminho de pacote sem "exports" (ex.: "next/server"): o bundler do
+    // Next resolve sem extensão, o ESM puro do Node exige ".js".
+    const subcaminhoDePacote = /^[a-z@][^:]*\/[^.]+$/i.test(specifier);
+    if (erro?.code === "ERR_MODULE_NOT_FOUND" && subcaminhoDePacote) {
+      return nextResolve(specifier + ".js", context);
+    }
+    throw erro;
+  }
 }

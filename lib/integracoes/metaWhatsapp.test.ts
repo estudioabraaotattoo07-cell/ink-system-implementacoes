@@ -18,6 +18,7 @@ const meta = await import("@/lib/integracoes/metaWhatsapp");
 const { descriptografarCredencial } = await import("@/lib/integracoes/credenciais");
 const {
   conectarWhatsapp, estadoWhatsapp, validarPedido, lerConfigMeta, usuarioHabilitadoWhatsapp, ErroConexao, PROVEDOR_META,
+  ativarWhatsapp, validarPedidoAtivacao,
 } = meta;
 
 const APP = "1032989656347607";
@@ -44,7 +45,9 @@ function fakeSb(inicial: { whatsapp?: Linhas; credenciais?: Linhas } = {}, falha
   const ops: { tabela: string; op: string; valores: any }[] = [];
   const padrao = (tabela: string) => tabela === "integracoes_whatsapp"
     ? { waba_id: null, phone_number_id: null, business_id: null, display_phone_number: null, status: "conectando",
-        webhook_inscrito_em: null, conectado_em: null, ultimo_erro: null, token_expira_em: null, atualizado_em: "2026-09-28T00:00:00Z" }
+        webhook_inscrito_em: null, webhook_ultimo_evento_em: null, registro_ultima_falha_em: null, conectado_em: null,
+        ultimo_erro: null, token_expira_em: null,
+        atualizado_em: "2026-09-28T00:00:00Z" }
     : {};
   const violaUnico = (tabela: string, linha: any) => tabela === "integracoes_whatsapp"
     && tabelas[tabela].some((r) => r.user_id !== linha.user_id
@@ -109,7 +112,7 @@ function fakeSb(inicial: { whatsapp?: Linhas; credenciais?: Linhas } = {}, falha
 
 const OK = (body: unknown, status = 200) => ({ status, body });
 function fakeMeta(sobrescrever: Record<string, () => { status: number; body: unknown } | "rede"> = {}) {
-  const chamadas: { url: URL; auth: string | null }[] = [];
+  const chamadas: { url: URL; auth: string | null; metodo: string; corpo: string | null; tipo: string }[] = [];
   const respostas: Record<string, () => { status: number; body: unknown } | "rede"> = {
     troca: () => OK({ access_token: TOKEN, token_type: "bearer" }),
     debug: () => OK({ data: { is_valid: true, app_id: APP, expires_at: 0, granular_scopes: [
@@ -117,14 +120,24 @@ function fakeMeta(sobrescrever: Record<string, () => { status: number; body: unk
       { scope: "whatsapp_business_messaging", target_ids: [WABA] },
     ] } }),
     telefones: () => OK({ data: [{ id: "999", display_phone_number: "+55 11 0000-0000" }, { id: PHONE, display_phone_number: "+55 27 99999-0000" }] }),
+    // Fase 3 (ativação)
+    inscrever: () => OK({ success: true }),
+    inscricao: () => OK({ data: [{ whatsapp_business_api_data: { id: APP, name: "Ink System", link: "https://x" } }] }),
+    numero: () => OK({ status: "CONNECTED", id: PHONE }),
+    registro: () => OK({ success: true }),
     ...sobrescrever,
   };
   const buscar = (async (entrada: any, init: any = {}) => {
     const url = new URL(String(entrada));
-    chamadas.push({ url, auth: init.headers?.Authorization ?? null });
-    const tipo = url.pathname.endsWith("/oauth/access_token") ? "troca"
-      : url.pathname.endsWith("/debug_token") ? "debug"
-      : url.pathname.endsWith("/phone_numbers") ? "telefones" : "desconhecido";
+    const metodo = String(init.method || "GET").toUpperCase();
+    const p = url.pathname;
+    const tipo = p.endsWith("/oauth/access_token") ? "troca"
+      : p.endsWith("/debug_token") ? "debug"
+      : p.endsWith("/phone_numbers") ? "telefones"
+      : p.endsWith("/subscribed_apps") ? (metodo === "POST" ? "inscrever" : "inscricao")
+      : p.endsWith("/register") ? "registro"
+      : /^\/v[0-9.]+\/[0-9]+$/.test(p) ? "numero" : "desconhecido";
+    chamadas.push({ url, auth: init.headers?.Authorization ?? null, metodo, corpo: init.body ?? null, tipo });
     const r = respostas[tipo]?.();
     if (!r) throw new Error("chamada inesperada à Meta: " + url.pathname);
     if (r === "rede") throw new TypeError("fetch failed");
@@ -223,7 +236,10 @@ test("sucesso: nunca grava status 'conectado' nem conectado_em nesta fase", () =
   assert.doesNotMatch(gravacoes, /status:\s*"conectado"/);
   // só null (tentativa nova) ou o valor ANTERIOR (restauração) -- nunca um valor novo
   assert.deepEqual(gravacoes.match(/conectado_em:[^,\n]*/g), ["conectado_em: null", "conectado_em: anterior!.conectado_em"]);
-  assert.doesNotMatch(codigo, /status:\s*"conectado"/);
+  // Fase 3: 'conectado' só aparece dentro de ativarWhatsapp (a promoção e o retorno dela)
+  const inicioAtivacao = codigo.indexOf("export async function ativarWhatsapp");
+  const ocorrencias = [...codigo.matchAll(/status:\s*"conectado"/g)].map((m) => m.index!);
+  assert.ok(ocorrencias.length > 0 && ocorrencias.every((i) => i > inicioAtivacao));
 });
 
 test("ordem: conflito e 'conectando' antes da Meta; troca do code é a 1ª chamada; cofre antes dos metadados", async () => {
@@ -348,8 +364,9 @@ const WABA2 = "203300000000001";
 const PHONE2 = "203300000000002";
 const linhaAnterior = () => ({
   user_id: USER, waba_id: WABA, phone_number_id: PHONE, business_id: null, display_phone_number: "+55 27 99999-0000",
-  status: "conectando", webhook_inscrito_em: null, conectado_em: null, ultimo_erro: null,
-  token_expira_em: "2027-01-01T00:00:00.000Z", atualizado_em: "2026-09-27T10:00:00Z",
+  status: "conectando", webhook_inscrito_em: null, webhook_ultimo_evento_em: "2026-09-27T09:00:00.000Z",
+  registro_ultima_falha_em: "2026-09-27T08:00:00.000Z", conectado_em: null,
+  ultimo_erro: null, token_expira_em: "2027-01-01T00:00:00.000Z", atualizado_em: "2026-09-27T10:00:00Z",
 });
 const credencialAnterior = () => ({
   user_id: USER, provedor: PROVEDOR_META, credencial_cifrada: "v1.token-antigo-cifrado", status: "ativa",
@@ -479,7 +496,8 @@ test("estado: 'conectando' com token e IDs armazenados continua conectado:false 
   assert.equal(estado.phone_number_id, PHONE);
   assert.doesNotMatch(JSON.stringify(estado), new RegExp(TOKEN));
   assert.deepEqual(Object.keys(estado).sort(), ["atualizado_em", "business_id", "conectado", "conectado_em", "display_phone_number",
-    "habilitado", "phone_number_id", "status", "token_expira_em", "ultimo_erro", "waba_id", "webhook_inscrito_em"].sort());
+    "habilitado", "phone_number_id", "status", "token_expira_em", "ultimo_erro", "waba_id", "webhook_inscrito_em",
+    "webhook_ultimo_evento_em"].sort());
 });
 
 test("estado (preparado para a Fase 3): 'conectado' só vale com token no cofre", async () => {
@@ -522,4 +540,262 @@ test("rota: user_id vem só da sessão; log só com o código curto; nenhuma res
 test("cofre genérico: meta_whatsapp continua fora de PROVEDORES (o PUT/DELETE de /api/integracoes não toca o token da Meta)", () => {
   const integracoes = readFileSync(new URL("../../app/api/integracoes/route.ts", import.meta.url), "utf8");
   assert.match(integracoes, /const PROVEDORES = \["anthropic", "zenvia"\];/);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fase 3 — ativação (inscrição da WABA, registro do número, promoção)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const { criptografarCredencial } = await import("@/lib/integracoes/credenciais");
+const PIN = "482915";
+const credencialReal = () => ({
+  user_id: USER, provedor: PROVEDOR_META, status: "ativa", testado_em: "2026-09-28T11:00:00Z", updated_at: "2026-09-28T11:00:00Z",
+  credencial_cifrada: criptografarCredencial(JSON.stringify({ access_token: TOKEN, app_id: APP, waba_id: WABA, phone_number_id: PHONE })),
+});
+const linhaConectando = (extra: Record<string, unknown> = {}) =>
+  ({ ...linhaAnterior(), webhook_ultimo_evento_em: null, registro_ultima_falha_em: null, ...extra });
+const ativar = (sb: any, buscar: typeof fetch, pin: string | null = null, agora = "2026-09-28T12:00:00Z") =>
+  ativarWhatsapp({ sb, userId: USER, pin, config: CONFIG, buscar, agora: () => new Date(agora) });
+// respostas em sequência (a 1ª chamada recebe a 1ª, e assim por diante)
+const seq = (...rs: { status: number; body: unknown }[]) => { let i = 0; return () => rs[Math.min(i++, rs.length - 1)]; };
+const PENDENTE = OK({ status: "PENDING", id: PHONE });
+
+test("ativação: payload -- PIN opcional, e quando presente exatamente 6 dígitos em texto", () => {
+  assert.deepEqual(validarPedidoAtivacao(null), { pin: null });
+  assert.deepEqual(validarPedidoAtivacao({}), { pin: null });
+  assert.deepEqual(validarPedidoAtivacao({ pin: "" }), { pin: null });
+  assert.deepEqual(validarPedidoAtivacao({ pin: PIN, user_id: OUTRO }), { pin: PIN });
+  for (const ruim of ["x", { pin: "12345" }, { pin: "1234567" }, { pin: 482915 }, { pin: "48a915" }, { pin: " 482915" }]) {
+    assert.equal(validarPedidoAtivacao(ruim), null, JSON.stringify(ruim));
+  }
+});
+
+test("ativação: número já CONNECTED -> inscreve, confirma, promove a 'conectado' (sem registro, sem PIN)", async () => {
+  const { sb, tabelas } = fakeSb({ whatsapp: [linhaConectando()], credenciais: [credencialReal()] });
+  const m = fakeMeta();
+  const r = await ativar(sb, m.buscar);
+  assert.deepEqual(r, { status: "conectado", waba_id: WABA, phone_number_id: PHONE,
+    webhook_inscrito_em: "2026-09-28T12:00:00.000Z", conectado_em: "2026-09-28T12:00:00.000Z" });
+  assert.deepEqual(m.chamadas.map((c) => c.tipo), ["debug", "inscrever", "inscricao", "numero"]);
+  const linha = tabelas.integracoes_whatsapp[0];
+  assert.equal(linha.status, "conectado");
+  assert.equal(linha.conectado_em, "2026-09-28T12:00:00.000Z");
+  assert.equal(linha.webhook_inscrito_em, "2026-09-28T12:00:00.000Z");
+  assert.equal(linha.ultimo_erro, null);
+  // o GET da Fase 2 passa a mostrar conectado:true
+  assert.equal((await estadoWhatsapp(sb, USER)).conectado, true);
+  // chamadas com o token do cliente no cabeçalho; consulta do número pede só status
+  assert.ok(m.chamadas.filter((c) => c.tipo !== "debug").every((c) => c.auth === `Bearer ${TOKEN}`));
+  assert.equal(m.chamadas.find((c) => c.tipo === "numero")!.url.searchParams.get("fields"), "status");
+  assert.equal(m.chamadas.find((c) => c.tipo === "inscrever")!.metodo, "POST");
+});
+
+test("ativação: número não CONNECTED e sem PIN -> 409 pin_necessario, inscrição já gravada, segue 'conectando'", async () => {
+  const { sb, tabelas } = fakeSb({ whatsapp: [linhaConectando()], credenciais: [credencialReal()] });
+  const m = fakeMeta({ numero: () => PENDENTE });
+  const erro = await falhaCom(ativar(sb, m.buscar));
+  assert.equal(erro.codigo, "pin_necessario");
+  assert.equal(erro.status, 409);
+  assert.ok(!m.chamadas.some((c) => c.tipo === "registro"));
+  const linha = tabelas.integracoes_whatsapp[0];
+  assert.equal(linha.status, "conectando");
+  assert.equal(linha.webhook_inscrito_em, "2026-09-28T12:00:00.000Z");
+  assert.equal(linha.ultimo_erro, null, "pedido de ação não é gravado como erro");
+});
+
+test("ativação: com PIN -> registra o número (PIN só no corpo) e promove", async () => {
+  const { sb, tabelas, ops } = fakeSb({ whatsapp: [linhaConectando()], credenciais: [credencialReal()] });
+  const m = fakeMeta({ numero: seq(PENDENTE, OK({ status: "CONNECTED", id: PHONE })) });
+  const r = await ativar(sb, m.buscar, PIN);
+  assert.equal(r.status, "conectado");
+  assert.deepEqual(m.chamadas.map((c) => c.tipo), ["debug", "inscrever", "inscricao", "numero", "registro", "numero"]);
+  const registro = m.chamadas.find((c) => c.tipo === "registro")!;
+  assert.equal(registro.metodo, "POST");
+  assert.deepEqual(JSON.parse(String(registro.corpo)), { messaging_product: "whatsapp", pin: PIN });
+  assert.equal(registro.auth, `Bearer ${TOKEN}`);
+  // PIN nunca em URL, banco ou resposta
+  assert.ok(m.chamadas.every((c) => !c.url.href.includes(PIN)));
+  assert.doesNotMatch(JSON.stringify(ops), new RegExp(PIN));
+  assert.doesNotMatch(JSON.stringify(tabelas), new RegExp(PIN));
+  assert.doesNotMatch(JSON.stringify(r), new RegExp(PIN));
+  assert.equal(tabelas.integracoes_whatsapp[0].status, "conectado");
+});
+
+for (const [nome, meta, codigo, status, inscrito] of [
+  ["debug_token inválido", () => fakeMeta({ debug: () => OK({ data: { is_valid: false, app_id: APP } }) }), "token_invalido", 502, false],
+  ["inscrição sem success", () => fakeMeta({ inscrever: () => OK({ success: false }) }), "meta_subscribe:sem_codigo", 502, false],
+  ["inscrição recusada pela Meta", () => fakeMeta({ inscrever: () => OK({ error: { code: 200 } }, 403) }), "meta_subscribe:200", 502, false],
+  ["nosso app ausente da lista de inscritos", () => fakeMeta({ inscricao: () => OK({ data: [{ whatsapp_business_api_data: { id: "999" } }] }) }), "inscricao_nao_confirmada", 502, false],
+  ["registro no limite da Meta (133016)", () => fakeMeta({ numero: () => PENDENTE, registro: () => OK({ error: { code: 133016 } }, 400) }), "registro_numero:133016", 429, true],
+  ["registro recusado", () => fakeMeta({ numero: () => PENDENTE, registro: () => OK({ error: { code: 100 } }, 400) }), "registro_numero:100", 502, true],
+  ["número continua não CONNECTED após o registro", () => fakeMeta({ numero: () => PENDENTE }), "numero_nao_conectado", 502, true],
+] as const) {
+  test(`ativação: falha (${nome}) -> continua 'conectando', ultimo_erro = ${codigo}`, async () => {
+    const { sb, tabelas } = fakeSb({ whatsapp: [linhaConectando()], credenciais: [credencialReal()] });
+    const erro = await falhaCom(ativar(sb, meta().buscar, PIN));
+    assert.equal(erro.codigo, codigo);
+    assert.equal(erro.status, status);
+    const linha = tabelas.integracoes_whatsapp[0];
+    assert.equal(linha.status, "conectando");
+    assert.equal(linha.conectado_em, null);
+    assert.equal(linha.ultimo_erro, codigo);
+    assert.equal(linha.webhook_inscrito_em, inscrito ? "2026-09-28T12:00:00.000Z" : null, "só depois da confirmação do GET");
+    // só a falha do POST /register liga o relógio da espera
+    assert.equal(linha.registro_ultima_falha_em, codigo.startsWith("registro_numero:") ? "2026-09-28T12:00:00.000Z" : null);
+  });
+}
+
+// ── espera entre tentativas de registro: relógio exclusivo ────────────────
+
+test("espera de registro: falha recente (registro_ultima_falha_em < 10 min) bloqueia sem gastar tentativa", async () => {
+  const a = fakeSb({ whatsapp: [linhaConectando({ registro_ultima_falha_em: "2026-09-28T11:55:00.000Z" })], credenciais: [credencialReal()] });
+  const m = fakeMeta({ numero: () => PENDENTE });
+  const erro = await falhaCom(ativar(a.sb, m.buscar, PIN, "2026-09-28T12:00:00Z"));
+  assert.equal(erro.codigo, "aguarde_registro");
+  assert.equal(erro.status, 429);
+  assert.ok(!m.chamadas.some((c) => c.tipo === "registro"), "não gasta tentativa de registro");
+  assert.equal(a.tabelas.integracoes_whatsapp[0].registro_ultima_falha_em, "2026-09-28T11:55:00.000Z", "relógio intacto");
+});
+
+test("espera de registro: após 10 min da falha, registra e promove -- e a promoção ZERA o relógio", async () => {
+  const b = fakeSb({ whatsapp: [linhaConectando({ ultimo_erro: "registro_numero:100", registro_ultima_falha_em: "2026-09-28T11:49:00.000Z" })],
+    credenciais: [credencialReal()] });
+  const m = fakeMeta({ numero: seq(PENDENTE, OK({ status: "CONNECTED" })) });
+  assert.equal((await ativar(b.sb, m.buscar, PIN, "2026-09-28T12:00:00Z")).status, "conectado");
+  assert.ok(m.chamadas.some((c) => c.tipo === "registro"));
+  assert.equal(b.tabelas.integracoes_whatsapp[0].registro_ultima_falha_em, null);
+  assert.equal(b.tabelas.integracoes_whatsapp[0].ultimo_erro, null);
+});
+
+test("espera de registro: atualizado_em, webhook_inscrito_em e webhook_ultimo_evento_em RECENTES não estendem a espera", async () => {
+  // falha de registro há 11 min; todo o resto da linha mexido há segundos
+  const linha = linhaConectando({
+    ultimo_erro: "registro_numero:100",
+    registro_ultima_falha_em: "2026-09-28T11:49:00.000Z",
+    atualizado_em: "2026-09-28T11:59:50.000Z",
+    webhook_inscrito_em: "2026-09-28T11:59:50.000Z",
+    webhook_ultimo_evento_em: "2026-09-28T11:59:55.000Z",
+  });
+  const { sb } = fakeSb({ whatsapp: [linha], credenciais: [credencialReal()] });
+  const m = fakeMeta({ numero: seq(PENDENTE, OK({ status: "CONNECTED" })) });
+  assert.equal((await ativar(sb, m.buscar, PIN, "2026-09-28T12:00:00Z")).status, "conectado");
+  assert.ok(m.chamadas.some((c) => c.tipo === "registro"), "a tentativa acontece");
+});
+
+test("espera de registro: atualizado_em ANTIGO não encurta a espera -- vale só registro_ultima_falha_em (e ultimo_erro não importa)", async () => {
+  const linha = linhaConectando({ ultimo_erro: null, registro_ultima_falha_em: "2026-09-28T11:58:00.000Z", atualizado_em: "2026-09-01T00:00:00.000Z" });
+  const { sb } = fakeSb({ whatsapp: [linha], credenciais: [credencialReal()] });
+  const erro = await falhaCom(ativar(sb, fakeMeta({ numero: () => PENDENTE }).buscar, PIN, "2026-09-28T12:00:00Z"));
+  assert.equal(erro.codigo, "aguarde_registro");
+});
+
+test("espera de registro: tentativas repetidas (cada uma grava webhook_inscrito_em) não mudam o relógio", async () => {
+  // no banco real, cada uma dessas gravações também renova atualizado_em pelo gatilho da Fase 1
+  const { sb, tabelas } = fakeSb({ whatsapp: [linhaConectando({ registro_ultima_falha_em: "2026-09-28T11:55:00.000Z" })], credenciais: [credencialReal()] });
+  const m = fakeMeta({ numero: () => PENDENTE });
+  await falhaCom(ativar(sb, m.buscar, PIN, "2026-09-28T12:00:00Z"));
+  await falhaCom(ativar(sb, m.buscar, PIN, "2026-09-28T12:04:00Z"));
+  assert.equal(tabelas.integracoes_whatsapp[0].registro_ultima_falha_em, "2026-09-28T11:55:00.000Z");
+  assert.ok(!m.chamadas.some((c) => c.tipo === "registro"), "nenhuma tentativa dentro dos 10 min");
+});
+
+test("espera de registro: chamar sem PIN não mexe no relógio (a espera não é contornável)", async () => {
+  const { sb, tabelas } = fakeSb({ whatsapp: [linhaConectando({ registro_ultima_falha_em: "2026-09-28T11:58:00.000Z" })], credenciais: [credencialReal()] });
+  await falhaCom(ativar(sb, fakeMeta({ numero: () => PENDENTE }).buscar, null));
+  assert.equal(tabelas.integracoes_whatsapp[0].registro_ultima_falha_em, "2026-09-28T11:58:00.000Z");
+});
+
+test("espera de registro: reconexão nova (Fase 2) zera registro_ultima_falha_em; compensação restaura o valor anterior", async () => {
+  const nova = fakeSb({ whatsapp: [linhaConectando({ registro_ultima_falha_em: "2026-09-28T11:58:00.000Z" })], credenciais: [credencialReal()] });
+  await conectar(nova.sb, fakeMeta().buscar);
+  assert.equal(nova.tabelas.integracoes_whatsapp[0].registro_ultima_falha_em, null);
+  // compensação: linhaAnterior() carrega registro_ultima_falha_em e volta intacta (ver testes de compensação)
+  assert.equal(linhaAnterior().registro_ultima_falha_em, "2026-09-27T08:00:00.000Z");
+});
+
+test("espera de registro (fonte): a ativação nunca lê atualizado_em", () => {
+  const codigo = src.replace(/\/\/[^\n]*/g, "");
+  const ativacao = codigo.slice(codigo.indexOf("export async function ativarWhatsapp"));
+  assert.doesNotMatch(ativacao, /atualizado_em/);
+  assert.match(ativacao, /Date\.parse\(String\(linha\.registro_ultima_falha_em \?\? ""\)\)/);
+});
+
+for (const [nome, inicial] of [
+  ["já 'conectado'", { whatsapp: [linhaConectando({ status: "conectado", conectado_em: "2026-09-01T00:00:00Z" })] }],
+  ["em 'erro'", { whatsapp: [linhaConectando({ status: "erro", ultimo_erro: "x" })] }],
+  ["sem linha", {}],
+  ["'conectando' sem IDs (tentativa em andamento)", { whatsapp: [linhaConectando({ waba_id: null, phone_number_id: null })] }],
+] as const) {
+  test(`ativação: estado inválido (${nome}) -> 409 sem chamar a Meta e sem escrever`, async () => {
+    const { sb, tabelas, ops } = fakeSb({ ...(inicial as any), credenciais: [credencialReal()] });
+    const antes = JSON.stringify(tabelas.integracoes_whatsapp);
+    const m = fakeMeta();
+    const erro = await falhaCom(ativar(sb, m.buscar, PIN));
+    assert.equal(erro.codigo, "estado_invalido");
+    assert.equal(erro.status, 409);
+    assert.equal(m.chamadas.length, 0);
+    assert.ok(!ops.some((o) => o.op !== "select"));
+    assert.equal(JSON.stringify(tabelas.integracoes_whatsapp), antes);
+  });
+}
+
+test("ativação: sem token no cofre -> credencial_ausente, sem chamar a Meta", async () => {
+  const { sb, tabelas } = fakeSb({ whatsapp: [linhaConectando()] });
+  const m = fakeMeta();
+  const erro = await falhaCom(ativar(sb, m.buscar));
+  assert.equal(erro.codigo, "credencial_ausente");
+  assert.equal(m.chamadas.length, 0);
+  assert.equal(tabelas.integracoes_whatsapp[0].status, "conectando");
+});
+
+test("ativação: reconexão no meio (IDs trocados) -> estado_alterado; nada é gravado sobre a conexão nova", async () => {
+  const { sb, tabelas } = fakeSb({ whatsapp: [linhaConectando()], credenciais: [credencialReal()] });
+  const m = fakeMeta({
+    numero: () => {
+      // um POST da Fase 2 concorrente regrava a linha com outra WABA/número
+      Object.assign(tabelas.integracoes_whatsapp[0], { waba_id: "203300000000001", phone_number_id: "203300000000002",
+        webhook_inscrito_em: null, ultimo_erro: null });
+      return OK({ status: "CONNECTED" });
+    },
+  });
+  const erro = await falhaCom(ativar(sb, m.buscar));
+  assert.equal(erro.codigo, "estado_alterado");
+  const linha = tabelas.integracoes_whatsapp[0];
+  assert.equal(linha.status, "conectando", "não promove a conexão nova");
+  assert.equal(linha.waba_id, "203300000000001");
+  assert.equal(linha.webhook_inscrito_em, null);
+  assert.equal(linha.ultimo_erro, null, "nem o erro é escrito sobre a conexão nova");
+});
+
+test("ativação: promoção com ZERO linhas afetadas não conta como sucesso", async () => {
+  const { sb, tabelas } = fakeSb({ whatsapp: [linhaConectando()], credenciais: [credencialReal()] },
+    { "integracoes_whatsapp.update": [null, { vazio: true }] }); // 1ª (inscrição) normal, 2ª (promoção) 0 linhas
+  const erro = await falhaCom(ativar(sb, fakeMeta().buscar));
+  assert.equal(erro.codigo, "estado_alterado");
+  assert.equal(tabelas.integracoes_whatsapp[0].status, "conectando");
+});
+
+test("ativação (fonte): toda escrita é condicionada à mesma conexão e confirma 1 linha", () => {
+  const codigo = src.replace(/\/\/[^\n]*/g, "");
+  const ativacao = codigo.slice(codigo.indexOf("export async function ativarWhatsapp"));
+  assert.match(ativacao, /\.update\(valores\)\s*\.eq\("user_id", userId\)\.eq\("status", "conectando"\)\.eq\("waba_id", wabaId\)\.eq\("phone_number_id", phoneNumberId\)\s*\.select\("user_id"\)/);
+  assert.equal((ativacao.match(/sb\.from\("integracoes_whatsapp"\)\.update/g) || []).length, 1, "só o helper condicional escreve");
+  assert.doesNotMatch(ativacao, /console\./);
+  assert.doesNotMatch(codigo, /platform_type/, "campo não documentado não é usado");
+  assert.match(codigo, /const STATUS_OPERACIONAL = "CONNECTED";/);
+});
+
+test("rota de ativação: portões na ordem, PIN só no corpo, nunca em log/resposta", () => {
+  const rotaAtivacao = readFileSync(new URL("../../app/api/whatsapp/ativacao/route.ts", import.meta.url), "utf8");
+  const post = rotaAtivacao.slice(rotaAtivacao.indexOf("export async function POST"));
+  const ordem = ["origemPermitida(req)", "autenticarChamador(req)", 'auth.tipo !== "user"', "excedeuLimite(", "usuarioTemAcessoCrm(",
+    "usuarioHabilitadoWhatsapp(", "lerConfigMeta()", "validarPedidoAtivacao(", "ativarWhatsapp("].map((t) => post.indexOf(t));
+  ordem.forEach((p, i) => assert.ok(p !== -1 && (i === 0 || p > ordem[i - 1]), `passo fora de ordem: ${i}`));
+  assert.match(post, /userId: auth\.userId, pin: pedido\.pin, config/);
+  assert.deepEqual(rotaAtivacao.match(/console\.(log|error|warn|info)\([^)]*\)/g), ['console.error("whatsapp/ativacao:", falha.codigo)']);
+  // o PIN só é repassado à ativação: nenhum outro uso (log, resposta, espalhamento do pedido)
+  assert.equal((rotaAtivacao.match(/pedido\.pin/g) || []).length, 1);
+  assert.doesNotMatch(rotaAtivacao, /\.\.\.pedido/);
+  assert.match(rotaAtivacao, /return responder\(req, \{ ok: true, \.\.\.resultado \}\);/);
+  assert.doesNotMatch(rotaAtivacao, /access_token|accessToken/);
 });
