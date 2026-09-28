@@ -1,8 +1,8 @@
 -- INTEGRAÇÃO META WHATSAPP — FASE 3: sinal de vida do webhook e relógio de
 -- falha do registro do número.
 --
--- ⚠️ ESTE ARQUIVO AINDA NÃO FOI EXECUTADO. Fica LOCAL até autorização
--- explícita de rodar no Supabase (mesma disciplina de todo o projeto).
+-- ✅ APLICADA E HOMOLOGADA no Supabase em 28/09/2026. Não executar de novo:
+-- o precheck aborta se as colunas já existirem.
 --
 -- ⚠️ ORDEM OBRIGATÓRIA: aplicar ESTA migration ANTES de publicar o código da
 -- Fase 3. O backend passa a ler/gravar as duas colunas; sem elas, as rotas
