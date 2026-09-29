@@ -13,6 +13,16 @@ import { criptografarCredencial, descriptografarCredencial } from "@/lib/integra
 //   GET /oauth/access_token?client_id&client_secret&code  (code vale 30 s)
 //   GET /debug_token?input_token  (granular_scopes[].target_ids)
 //   GET /{waba_id}/phone_numbers  (id, display_phone_number)
+//
+// Dois modos, decididos pelo pedido (nunca misturados):
+//   'padrao'       -- o Embedded Signup devolve waba_id + phone_number_id.
+//   'coexistencia' -- onboarding do app WhatsApp Business (evento
+//                     FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING): só waba_id. O
+//                     número é DESCOBERTO aqui, na própria WABA, e só vale se
+//                     for exatamente um com is_on_biz_app=true e
+//                     platform_type=CLOUD_API. Nada de /register nesse modo:
+//                     o número já está registrado e ativo no app.
+//   GET /{phone_number_id}?fields=is_on_biz_app,platform_type
 
 export const PROVEDOR_META = "meta_whatsapp";
 const ID_META = /^[0-9]{1,32}$/;
@@ -21,8 +31,13 @@ const ESCOPOS_OBRIGATORIOS = ["whatsapp_business_management", "whatsapp_business
 const TIMEOUT_META_MS = 10_000;
 
 export type ConfigMeta = { appId: string; appSecret: string; versao: string };
-export type PedidoConexao = { code: string; wabaId: string; phoneNumberId: string };
+export type ModoConexao = "padrao" | "coexistencia";
+// phoneNumberId null = pedido de Coexistência (número descoberto no servidor).
+export type PedidoConexao = { code: string; wabaId: string; phoneNumberId: string | null };
 type Busca = typeof fetch;
+
+const MAX_NUMEROS_WABA = 25;
+const MAX_PAGINAS_NUMEROS = 5;
 
 export class ErroConexao extends Error {
   codigo: string;
@@ -51,14 +66,17 @@ export function usuarioHabilitadoWhatsapp(userId: string, env: NodeJS.ProcessEnv
   return Boolean(userId) && permitidos.includes(userId.toLowerCase());
 }
 
-// Só os três campos confiáveis. business_id e display_phone_number vindos do
+// Só os campos confiáveis. business_id e display_phone_number vindos do
 // navegador são descartados: o número exibido é lido da Meta, e o business_id
 // não tem fonte server-side confiável nesta fase (fica null).
+// phone_number_id ausente (ou null) = Coexistência; presente precisa ser um
+// ID válido (string vazia ou malformada continua sendo 400).
 export function validarPedido(body: unknown): PedidoConexao | null {
   if (!body || typeof body !== "object") return null;
   const { code, waba_id, phone_number_id } = body as Record<string, unknown>;
   if (typeof code !== "string" || !/^\S{1,2048}$/.test(code)) return null;
   if (typeof waba_id !== "string" || !ID_META.test(waba_id)) return null;
+  if (phone_number_id === undefined || phone_number_id === null) return { code, wabaId: waba_id, phoneNumberId: null };
   if (typeof phone_number_id !== "string" || !ID_META.test(phone_number_id)) return null;
   return { code, wabaId: waba_id, phoneNumberId: phone_number_id };
 }
@@ -142,16 +160,62 @@ export async function confirmarTelefone(config: ConfigMeta, accessToken: string,
   return { displayPhoneNumber: exibido };
 }
 
+// ── Coexistência: descoberta do número ──────────────────────────────────────
+// O número está em Coexistência quando is_on_biz_app === true e
+// platform_type === 'CLOUD_API'. Qualquer outra coisa (campo ausente, false,
+// outro tipo) NÃO é elegível. Falha na consulta LANÇA: nunca se ignora um
+// candidato, senão "exatamente um" deixaria de ser verdade.
+
+export async function numeroEmCoexistencia(config: ConfigMeta, accessToken: string, phoneNumberId: string, buscar: Busca) {
+  const url = new URL(`https://graph.facebook.com/${config.versao}/${phoneNumberId}`);
+  url.searchParams.set("fields", "is_on_biz_app,platform_type");
+  const { ok, json } = await chamarGraph(buscar, url.toString(), accessToken);
+  if (!ok || !json || typeof json !== "object") throw new ErroConexao(`meta_numero:${codigoMeta(json)}`, 502);
+  return json.is_on_biz_app === true && json.platform_type === "CLOUD_API";
+}
+
+export async function descobrirNumeroCoexistencia(config: ConfigMeta, accessToken: string, wabaId: string, buscar: Busca) {
+  const candidatos: { id: string; exibido: string | null }[] = [];
+  let depois: string | null = null;
+  for (let pagina = 0; ; pagina++) {
+    if (pagina >= MAX_PAGINAS_NUMEROS) throw new ErroConexao("numeros_demais", 422);
+    const url = new URL(`https://graph.facebook.com/${config.versao}/${wabaId}/phone_numbers`);
+    url.searchParams.set("fields", "id,display_phone_number");
+    url.searchParams.set("limit", "100");
+    if (depois) url.searchParams.set("after", depois);
+    const { ok, json } = await chamarGraph(buscar, url.toString(), accessToken);
+    if (!ok || !Array.isArray(json?.data)) throw new ErroConexao(`meta_phone_numbers:${codigoMeta(json)}`, 502);
+    for (const n of json.data) {
+      const id = String(n?.id ?? "");
+      if (!ID_META.test(id)) continue;
+      candidatos.push({ id, exibido: typeof n?.display_phone_number === "string" ? n.display_phone_number.slice(0, 32) : null });
+    }
+    if (candidatos.length > MAX_NUMEROS_WABA) throw new ErroConexao("numeros_demais", 422);
+    const proximo = json?.paging?.next ? json?.paging?.cursors?.after : null;
+    if (typeof proximo !== "string" || !proximo) break;
+    depois = proximo;
+  }
+
+  const elegiveis: { id: string; exibido: string | null }[] = [];
+  for (const candidato of candidatos) {
+    if (await numeroEmCoexistencia(config, accessToken, candidato.id, buscar)) elegiveis.push(candidato);
+    if (elegiveis.length > 1) break;   // mais de um já basta para recusar
+  }
+  if (elegiveis.length === 0) throw new ErroConexao("nenhum_numero_elegivel", 422);
+  if (elegiveis.length > 1) throw new ErroConexao("multiplos_numeros_elegiveis", 422);
+  return { phoneNumberId: elegiveis[0].id, displayPhoneNumber: elegiveis[0].exibido };
+}
+
 // ── orquestração ────────────────────────────────────────────────────────────
 
 type Linha = {
   user_id: string; waba_id: string | null; phone_number_id: string | null; business_id: string | null;
-  display_phone_number: string | null; status: string; webhook_inscrito_em: string | null;
+  display_phone_number: string | null; modo_conexao: string; status: string; webhook_inscrito_em: string | null;
   webhook_ultimo_evento_em: string | null; registro_ultima_falha_em: string | null;
   conectado_em: string | null; ultimo_erro: string | null; token_expira_em: string | null; atualizado_em: string;
 };
 
-const COLUNAS = "user_id,waba_id,phone_number_id,business_id,display_phone_number,status,webhook_inscrito_em,webhook_ultimo_evento_em,registro_ultima_falha_em,conectado_em,ultimo_erro,token_expira_em,atualizado_em";
+const COLUNAS = "user_id,waba_id,phone_number_id,business_id,display_phone_number,modo_conexao,status,webhook_inscrito_em,webhook_ultimo_evento_em,registro_ultima_falha_em,conectado_em,ultimo_erro,token_expira_em,atualizado_em";
 
 async function lerLinha(sb: SupabaseClient, userId: string): Promise<Linha | null> {
   const { data, error } = await sb.from("integracoes_whatsapp").select(COLUNAS).eq("user_id", userId).maybeSingle();
@@ -195,10 +259,15 @@ export async function conectarWhatsapp({ sb, userId, pedido, config, buscar = fe
   const credencialAnterior = await lerCredencial(sb, userId);
   let cofreSobrescrito = false;   // o token novo já substituiu/criou a credencial
   let cofreRestaurado = false;    // e a compensação devolveu o cofre ao estado anterior
+  const phoneNumberIdPedido = pedido.phoneNumberId;
+  const modo: ModoConexao = phoneNumberIdPedido === null ? "coexistencia" : "padrao";
 
   try {
+    // Padrão: os dois IDs já são conhecidos. Coexistência: só a WABA agora; o
+    // número é checado logo depois de descoberto (abaixo), ainda antes de
+    // qualquer escrita de cofre ou de IDs.
     if (await idEmOutraConta(sb, userId, "waba_id", pedido.wabaId)
-        || await idEmOutraConta(sb, userId, "phone_number_id", pedido.phoneNumberId)) {
+        || (phoneNumberIdPedido !== null && await idEmOutraConta(sb, userId, "phone_number_id", phoneNumberIdPedido))) {
       throw new ErroConexao("conflito_outra_conta", 409);
     }
 
@@ -211,7 +280,18 @@ export async function conectarWhatsapp({ sb, userId, pedido, config, buscar = fe
     // O code expira em 30 s: troca antes de qualquer outra chamada à Meta.
     const { accessToken, expiresIn } = await trocarCodePorToken(config, pedido.code, buscar);
     const { expiraEmUnix } = await validarToken(config, accessToken, pedido.wabaId, buscar);
-    const { displayPhoneNumber } = await confirmarTelefone(config, accessToken, pedido.wabaId, pedido.phoneNumberId, buscar);
+
+    let phoneNumberId: string;
+    let displayPhoneNumber: string | null;
+    if (phoneNumberIdPedido === null) {
+      ({ phoneNumberId, displayPhoneNumber } = await descobrirNumeroCoexistencia(config, accessToken, pedido.wabaId, buscar));
+      if (await idEmOutraConta(sb, userId, "phone_number_id", phoneNumberId)) {
+        throw new ErroConexao("conflito_outra_conta", 409);
+      }
+    } else {
+      phoneNumberId = phoneNumberIdPedido;
+      ({ displayPhoneNumber } = await confirmarTelefone(config, accessToken, pedido.wabaId, phoneNumberId, buscar));
+    }
 
     const instante = agora();
     const tokenExpiraEm = expiraEmUnix
@@ -221,7 +301,7 @@ export async function conectarWhatsapp({ sb, userId, pedido, config, buscar = fe
     // 1º o cofre, depois os metadados.
     const segredo = JSON.stringify({
       access_token: accessToken, obtido_em: instante.toISOString(), app_id: config.appId,
-      waba_id: pedido.wabaId, phone_number_id: pedido.phoneNumberId,
+      waba_id: pedido.wabaId, phone_number_id: phoneNumberId,
     });
     const { error: erroCofre } = await sb.from("integracoes_credenciais").upsert({
       user_id: userId, provedor: PROVEDOR_META, credencial_cifrada: criptografarCredencial(segredo),
@@ -234,9 +314,10 @@ export async function conectarWhatsapp({ sb, userId, pedido, config, buscar = fe
     // Sucesso exige UMA linha atualizada: zero linhas é falha, não sucesso.
     const { data: atualizadas, error: erroMetadados } = await sb.from("integracoes_whatsapp").update({
       waba_id: pedido.wabaId,
-      phone_number_id: pedido.phoneNumberId,
+      phone_number_id: phoneNumberId,
       business_id: null,
       display_phone_number: displayPhoneNumber,
+      modo_conexao: modo,
       status: "conectando",
       conectado_em: null,
       webhook_inscrito_em: null,
@@ -253,8 +334,9 @@ export async function conectarWhatsapp({ sb, userId, pedido, config, buscar = fe
     return {
       status: "conectando" as const,
       waba_id: pedido.wabaId,
-      phone_number_id: pedido.phoneNumberId,
+      phone_number_id: phoneNumberId,
       display_phone_number: displayPhoneNumber,
+      modo_conexao: modo,
     };
   } catch (erro) {
     const falha = erro instanceof ErroConexao ? erro : new ErroConexao("falha_interna", 500);
@@ -283,7 +365,7 @@ export async function conectarWhatsapp({ sb, userId, pedido, config, buscar = fe
     const reverter = restaurarLinha
       ? {
           waba_id: anterior!.waba_id, phone_number_id: anterior!.phone_number_id, business_id: anterior!.business_id,
-          display_phone_number: anterior!.display_phone_number, status: anterior!.status,
+          display_phone_number: anterior!.display_phone_number, modo_conexao: anterior!.modo_conexao, status: anterior!.status,
           webhook_inscrito_em: anterior!.webhook_inscrito_em, webhook_ultimo_evento_em: anterior!.webhook_ultimo_evento_em,
           registro_ultima_falha_em: anterior!.registro_ultima_falha_em, conectado_em: anterior!.conectado_em,
           ultimo_erro: anterior!.ultimo_erro, token_expira_em: anterior!.token_expira_em,
@@ -309,6 +391,7 @@ export async function estadoWhatsapp(sb: SupabaseClient, userId: string) {
     phone_number_id: linha.phone_number_id,
     business_id: linha.business_id,
     display_phone_number: linha.display_phone_number,
+    modo_conexao: linha.modo_conexao,
     conectado_em: linha.conectado_em,
     webhook_inscrito_em: linha.webhook_inscrito_em,
     webhook_ultimo_evento_em: linha.webhook_ultimo_evento_em,
@@ -326,8 +409,10 @@ export async function estadoWhatsapp(sb: SupabaseClient, userId: string) {
 //   POST/GET /{waba_id}/subscribed_apps   (success / whatsapp_business_api_data.id)
 //   GET  /{phone_number_id}?fields=status  (operacional = "CONNECTED")
 //   POST /{phone_number_id}/register {messaging_product, pin}  (10 por 72 h; 133016)
-// platform_type NÃO é usado: não consta na documentação atual (On-Premises
-// foi desligado em 23/10/2025).
+// Modo 'coexistencia': NUNCA chama /register (a Meta manda pular o registro:
+// o número já está registrado e ativo no app WhatsApp Business) e não usa PIN.
+// A prova de prontidão é is_on_biz_app + platform_type (numeroEmCoexistencia).
+// Modo 'padrao': só aqui o status/PIN/registro continuam valendo.
 // ═══════════════════════════════════════════════════════════════════════════
 
 const STATUS_OPERACIONAL = "CONNECTED";
@@ -404,12 +489,18 @@ export async function ativarWhatsapp({ sb, userId, pin, config, buscar = fetch, 
   if (!linha || linha.status !== "conectando" || !linha.waba_id || !linha.phone_number_id) {
     throw new ErroConexao("estado_invalido", 409);
   }
+  // Fail-closed: modo desconhecido nunca cai no caminho que chama /register.
+  if (linha.modo_conexao !== "padrao" && linha.modo_conexao !== "coexistencia") {
+    throw new ErroConexao("estado_invalido", 409);
+  }
+  const modo = linha.modo_conexao as ModoConexao;
   const wabaId = linha.waba_id;
   const phoneNumberId = linha.phone_number_id;
   // Toda escrita da ativação é condicionada à MESMA conexão: se uma
-  // reconexão trocar os IDs ou o status no meio, nada é gravado.
+  // reconexão trocar os IDs, o modo ou o status no meio, nada é gravado.
   const atualizar = (valores: Record<string, unknown>) => sb.from("integracoes_whatsapp").update(valores)
     .eq("user_id", userId).eq("status", "conectando").eq("waba_id", wabaId).eq("phone_number_id", phoneNumberId)
+    .eq("modo_conexao", modo)
     .select("user_id");
 
   try {
@@ -423,20 +514,27 @@ export async function ativarWhatsapp({ sb, userId, pin, config, buscar = fetch, 
     if (erroInscricao) throw new ErroConexao("falha_interna", 500);
     if (!umaLinha(inscricao)) throw new ErroConexao("estado_alterado", 409);
 
-    let statusNumero = await consultarStatusNumero(config, token, phoneNumberId, buscar);
-    if (statusNumero !== STATUS_OPERACIONAL) {
-      if (!pin) throw new ErroConexao("pin_necessario", 409);
-      // Protege o limite da Meta (10 registros por 72 h): depois de uma falha
-      // de registro, nova tentativa só após 10 minutos. O relógio é
-      // EXCLUSIVAMENTE registro_ultima_falha_em -- nunca atualizado_em, que o
-      // gatilho renova em qualquer UPDATE (inscrição, sinal de vida...).
-      const ultimaFalha = Date.parse(String(linha.registro_ultima_falha_em ?? ""));
-      if (Number.isFinite(ultimaFalha) && agora().getTime() - ultimaFalha < ESPERA_APOS_FALHA_REGISTRO_MS) {
-        throw new ErroConexao("aguarde_registro", 429);
+    if (modo === "coexistencia") {
+      // Sem /register, sem PIN (um PIN eventualmente enviado é ignorado).
+      if (!(await numeroEmCoexistencia(config, token, phoneNumberId, buscar))) {
+        throw new ErroConexao("numero_coexistencia_nao_pronto", 409);
       }
-      await registrarNumero(config, token, phoneNumberId, pin, buscar);
-      statusNumero = await consultarStatusNumero(config, token, phoneNumberId, buscar);
-      if (statusNumero !== STATUS_OPERACIONAL) throw new ErroConexao("numero_nao_conectado", 502);
+    } else {
+      let statusNumero = await consultarStatusNumero(config, token, phoneNumberId, buscar);
+      if (statusNumero !== STATUS_OPERACIONAL) {
+        if (!pin) throw new ErroConexao("pin_necessario", 409);
+        // Protege o limite da Meta (10 registros por 72 h): depois de uma falha
+        // de registro, nova tentativa só após 10 minutos. O relógio é
+        // EXCLUSIVAMENTE registro_ultima_falha_em -- nunca atualizado_em, que o
+        // gatilho renova em qualquer UPDATE (inscrição, sinal de vida...).
+        const ultimaFalha = Date.parse(String(linha.registro_ultima_falha_em ?? ""));
+        if (Number.isFinite(ultimaFalha) && agora().getTime() - ultimaFalha < ESPERA_APOS_FALHA_REGISTRO_MS) {
+          throw new ErroConexao("aguarde_registro", 429);
+        }
+        await registrarNumero(config, token, phoneNumberId, pin, buscar);
+        statusNumero = await consultarStatusNumero(config, token, phoneNumberId, buscar);
+        if (statusNumero !== STATUS_OPERACIONAL) throw new ErroConexao("numero_nao_conectado", 502);
+      }
     }
 
     // Promoção: condicional à mesma conexão, exatamente 1 linha.
@@ -449,6 +547,7 @@ export async function ativarWhatsapp({ sb, userId, pin, config, buscar = fetch, 
 
     return {
       status: "conectado" as const,
+      modo_conexao: modo,
       waba_id: wabaId,
       phone_number_id: phoneNumberId,
       webhook_inscrito_em: inscritoEm,
@@ -458,9 +557,10 @@ export async function ativarWhatsapp({ sb, userId, pin, config, buscar = fetch, 
     const falha = erro instanceof ErroConexao ? erro : new ErroConexao("falha_interna", 500);
     // A linha continua 'conectando'; só o ultimo_erro registra o motivo, e só
     // se ainda for a mesma conexão (nunca escreve sobre uma reconexão).
-    // pin_necessario e aguarde_registro são pedidos de ação, não falhas: não
-    // são gravados. Falha do POST /register também grava o relógio da espera.
-    if (!["estado_alterado", "pin_necessario", "aguarde_registro"].includes(falha.codigo)) {
+    // pin_necessario, aguarde_registro e numero_coexistencia_nao_pronto são
+    // pedidos de ação/espera, não falhas: não são gravados. Falha do POST
+    // /register também grava o relógio da espera.
+    if (!["estado_alterado", "pin_necessario", "aguarde_registro", "numero_coexistencia_nao_pronto"].includes(falha.codigo)) {
       const falhaDeRegistro = falha.codigo.startsWith("registro_numero:");
       await atualizar({
         ultimo_erro: falha.codigo.slice(0, 500),

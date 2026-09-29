@@ -7,8 +7,9 @@ import {
 } from "@/lib/integracoes/metaWhatsapp";
 
 // Integração Meta WhatsApp — Fase 3. POST: inscreve a WABA no webhook do app,
-// registra o número na Cloud API (PIN de 6 dígitos, só quando necessário) e
-// promove 'conectando' -> 'conectado'. Só laboratório. O PIN nunca é gravado,
+// registra o número na Cloud API (PIN de 6 dígitos, só quando necessário e
+// NUNCA em Coexistência) e promove 'conectando' -> 'conectado'. Só laboratório.
+// O PIN nunca é gravado,
 // registrado em log nem devolvido. Portões idênticos aos de
 // /api/whatsapp/conexao.
 

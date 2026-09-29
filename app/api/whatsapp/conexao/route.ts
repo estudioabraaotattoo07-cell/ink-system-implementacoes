@@ -8,7 +8,8 @@ import {
 
 // Integração Meta WhatsApp — Fase 2. GET: estado da conexão do usuário
 // autenticado. POST: recebe o retorno do Embedded Signup (code + IDs), troca o
-// code por token server-to-server e grava cofre + metadados. Só laboratório
+// code por token server-to-server e grava cofre + metadados. Sem phone_number_id
+// = Coexistência (o número é descoberto na WABA, no servidor). Só laboratório
 // (META_WHATSAPP_USUARIOS_PERMITIDOS). Nenhuma resposta contém token.
 
 const responder = (req: Request, body: unknown, status = 200) =>
@@ -56,6 +57,8 @@ export async function POST(req: NextRequest) {
     // Só o código curto no log (nunca URL, token, code ou resposta da Meta).
     console.error("whatsapp/conexao:", falha.codigo);
     if (falha.status === 409) return responder(req, { ok: false, erro: "conflito_outra_conta" }, 409);
+    // Coexistência: nenhum número elegível / mais de um / número demais na WABA.
+    if (falha.status === 422) return responder(req, { ok: false, erro: falha.codigo }, 422);
     if (falha.status === 502) return responder(req, { ok: false, erro: "meta_recusou", codigo: falha.codigo }, 502);
     return responder(req, { ok: false, erro: falha.codigo === "cofre_falhou" || falha.codigo === "metadados_falhou" ? falha.codigo : "falha_interna" }, 500);
   }

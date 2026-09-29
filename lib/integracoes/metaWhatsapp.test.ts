@@ -39,12 +39,13 @@ type Linhas = Record<string, any>[];
 // chamada -- null = normal, { error } = falha, { vazio: true } = 0 linhas.
 function fakeSb(inicial: { whatsapp?: Linhas; credenciais?: Linhas } = {}, falhas: Record<string, any> = {}) {
   const tabelas: Record<string, Linhas> = {
-    integracoes_whatsapp: (inicial.whatsapp || []).map((l) => ({ ...l })),
+    // modo_conexao: o DEFAULT do banco ('padrao') vale para linha que não o informa
+    integracoes_whatsapp: (inicial.whatsapp || []).map((l) => ({ modo_conexao: "padrao", ...l })),
     integracoes_credenciais: (inicial.credenciais || []).map((l) => ({ ...l })),
   };
   const ops: { tabela: string; op: string; valores: any }[] = [];
   const padrao = (tabela: string) => tabela === "integracoes_whatsapp"
-    ? { waba_id: null, phone_number_id: null, business_id: null, display_phone_number: null, status: "conectando",
+    ? { waba_id: null, phone_number_id: null, business_id: null, display_phone_number: null, modo_conexao: "padrao", status: "conectando",
         webhook_inscrito_em: null, webhook_ultimo_evento_em: null, registro_ultima_falha_em: null, conectado_em: null,
         ultimo_erro: null, token_expira_em: null,
         atualizado_em: "2026-09-28T00:00:00Z" }
@@ -111,9 +112,10 @@ function fakeSb(inicial: { whatsapp?: Linhas; credenciais?: Linhas } = {}, falha
 // ── Graph API falsa ─────────────────────────────────────────────────────────
 
 const OK = (body: unknown, status = 200) => ({ status, body });
-function fakeMeta(sobrescrever: Record<string, () => { status: number; body: unknown } | "rede"> = {}) {
+type RespostaMeta = { status: number; body: unknown } | "rede";
+function fakeMeta(sobrescrever: Record<string, (url: URL) => RespostaMeta> = {}) {
   const chamadas: { url: URL; auth: string | null; metodo: string; corpo: string | null; tipo: string }[] = [];
-  const respostas: Record<string, () => { status: number; body: unknown } | "rede"> = {
+  const respostas: Record<string, (url: URL) => RespostaMeta> = {
     troca: () => OK({ access_token: TOKEN, token_type: "bearer" }),
     debug: () => OK({ data: { is_valid: true, app_id: APP, expires_at: 0, granular_scopes: [
       { scope: "whatsapp_business_management", target_ids: [WABA] },
@@ -138,7 +140,7 @@ function fakeMeta(sobrescrever: Record<string, () => { status: number; body: unk
       : p.endsWith("/register") ? "registro"
       : /^\/v[0-9.]+\/[0-9]+$/.test(p) ? "numero" : "desconhecido";
     chamadas.push({ url, auth: init.headers?.Authorization ?? null, metodo, corpo: init.body ?? null, tipo });
-    const r = respostas[tipo]?.();
+    const r = respostas[tipo]?.(url);
     if (!r) throw new Error("chamada inesperada à Meta: " + url.pathname);
     if (r === "rede") throw new TypeError("fetch failed");
     return new Response(JSON.stringify(r.body), { status: r.status });
@@ -146,7 +148,7 @@ function fakeMeta(sobrescrever: Record<string, () => { status: number; body: unk
   return { buscar, chamadas };
 }
 
-const conectar = (sb: any, buscar: typeof fetch, pedido = PEDIDO) =>
+const conectar = (sb: any, buscar: typeof fetch, pedido: { code: string; wabaId: string; phoneNumberId: string | null } = PEDIDO) =>
   conectarWhatsapp({ sb, userId: USER, pedido, config: CONFIG, buscar, agora: () => new Date("2026-09-28T12:00:00Z") });
 
 const falhaCom = async (promessa: Promise<unknown>) => {
@@ -196,9 +198,10 @@ test("sucesso: token cifrado no cofre, metadados gravados, status 'conectando' e
   const { sb, tabelas } = fakeSb();
   const { buscar } = fakeMeta();
   const r = await conectar(sb, buscar);
-  assert.deepEqual(r, { status: "conectando", waba_id: WABA, phone_number_id: PHONE, display_phone_number: "+55 27 99999-0000" });
+  assert.deepEqual(r, { status: "conectando", waba_id: WABA, phone_number_id: PHONE, display_phone_number: "+55 27 99999-0000", modo_conexao: "padrao" });
 
   const linha = tabelas.integracoes_whatsapp[0];
+  assert.equal(linha.modo_conexao, "padrao", "fluxo padrão grava o modo padrao");
   assert.equal(linha.status, "conectando");
   assert.equal(linha.conectado_em, null);
   assert.equal(linha.webhook_inscrito_em, null);
@@ -364,7 +367,7 @@ const WABA2 = "203300000000001";
 const PHONE2 = "203300000000002";
 const linhaAnterior = () => ({
   user_id: USER, waba_id: WABA, phone_number_id: PHONE, business_id: null, display_phone_number: "+55 27 99999-0000",
-  status: "conectando", webhook_inscrito_em: null, webhook_ultimo_evento_em: "2026-09-27T09:00:00.000Z",
+  modo_conexao: "padrao", status: "conectando", webhook_inscrito_em: null, webhook_ultimo_evento_em: "2026-09-27T09:00:00.000Z",
   registro_ultima_falha_em: "2026-09-27T08:00:00.000Z", conectado_em: null,
   ultimo_erro: null, token_expira_em: "2027-01-01T00:00:00.000Z", atualizado_em: "2026-09-27T10:00:00Z",
 });
@@ -496,7 +499,7 @@ test("estado: 'conectando' com token e IDs armazenados continua conectado:false 
   assert.equal(estado.phone_number_id, PHONE);
   assert.doesNotMatch(JSON.stringify(estado), new RegExp(TOKEN));
   assert.deepEqual(Object.keys(estado).sort(), ["atualizado_em", "business_id", "conectado", "conectado_em", "display_phone_number",
-    "habilitado", "phone_number_id", "status", "token_expira_em", "ultimo_erro", "waba_id", "webhook_inscrito_em",
+    "habilitado", "modo_conexao", "phone_number_id", "status", "token_expira_em", "ultimo_erro", "waba_id", "webhook_inscrito_em",
     "webhook_ultimo_evento_em"].sort());
 });
 
@@ -574,7 +577,7 @@ test("ativação: número já CONNECTED -> inscreve, confirma, promove a 'conect
   const { sb, tabelas } = fakeSb({ whatsapp: [linhaConectando()], credenciais: [credencialReal()] });
   const m = fakeMeta();
   const r = await ativar(sb, m.buscar);
-  assert.deepEqual(r, { status: "conectado", waba_id: WABA, phone_number_id: PHONE,
+  assert.deepEqual(r, { status: "conectado", modo_conexao: "padrao", waba_id: WABA, phone_number_id: PHONE,
     webhook_inscrito_em: "2026-09-28T12:00:00.000Z", conectado_em: "2026-09-28T12:00:00.000Z" });
   assert.deepEqual(m.chamadas.map((c) => c.tipo), ["debug", "inscrever", "inscricao", "numero"]);
   const linha = tabelas.integracoes_whatsapp[0];
@@ -778,10 +781,9 @@ test("ativação: promoção com ZERO linhas afetadas não conta como sucesso", 
 test("ativação (fonte): toda escrita é condicionada à mesma conexão e confirma 1 linha", () => {
   const codigo = src.replace(/\/\/[^\n]*/g, "");
   const ativacao = codigo.slice(codigo.indexOf("export async function ativarWhatsapp"));
-  assert.match(ativacao, /\.update\(valores\)\s*\.eq\("user_id", userId\)\.eq\("status", "conectando"\)\.eq\("waba_id", wabaId\)\.eq\("phone_number_id", phoneNumberId\)\s*\.select\("user_id"\)/);
+  assert.match(ativacao, /\.update\(valores\)\s*\.eq\("user_id", userId\)\.eq\("status", "conectando"\)\.eq\("waba_id", wabaId\)\.eq\("phone_number_id", phoneNumberId\)\s*\.eq\("modo_conexao", modo\)\s*\.select\("user_id"\)/);
   assert.equal((ativacao.match(/sb\.from\("integracoes_whatsapp"\)\.update/g) || []).length, 1, "só o helper condicional escreve");
   assert.doesNotMatch(ativacao, /console\./);
-  assert.doesNotMatch(codigo, /platform_type/, "campo não documentado não é usado");
   assert.match(codigo, /const STATUS_OPERACIONAL = "CONNECTED";/);
 });
 
@@ -798,4 +800,508 @@ test("rota de ativação: portões na ordem, PIN só no corpo, nunca em log/resp
   assert.doesNotMatch(rotaAtivacao, /\.\.\.pedido/);
   assert.match(rotaAtivacao, /return responder\(req, \{ ok: true, \.\.\.resultado \}\);/);
   assert.doesNotMatch(rotaAtivacao, /access_token|accessToken/);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Coexistência (onboarding do app WhatsApp Business): só waba_id no retorno.
+// O número é descoberto no servidor; ativação sem PIN e NUNCA com /register.
+// Sem histórico: nada de /smb_app_data, sync_type nem persistência de histórico.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PEDIDO_COEX = { code: "AQBcodeFalso", wabaId: WABA, phoneNumberId: null };
+const ELEGIVEL = { is_on_biz_app: true, platform_type: "CLOUD_API" };
+// GET /{id}?fields=is_on_biz_app,platform_type por número; id fora do mapa = erro 100
+const numeroCoex = (mapa: Record<string, Record<string, unknown>>) => (url: URL) => {
+  const id = url.pathname.split("/").pop()!;
+  return mapa[id] ? OK({ id, ...mapa[id] }) : OK({ error: { code: 100 } }, 400);
+};
+const listaDe = (...ids: string[]) => () => OK({ data: ids.map((id) => ({ id, display_phone_number: `+55 ${id}` })) });
+const metaCoex = (mapa: Record<string, Record<string, unknown>>, extra: Record<string, (url: URL) => RespostaMeta> = {}) =>
+  fakeMeta({ numero: numeroCoex(mapa), ...extra });
+const NAO_ELEGIVEL = { is_on_biz_app: false, platform_type: "CLOUD_API" };
+const linhaCoex = (extra: Record<string, unknown> = {}) => linhaConectando({ modo_conexao: "coexistencia", ...extra });
+const proibidos = /register|smb_app_data|sync_type|history/i;
+
+test("coexistência: payload SÓ com code e waba_id é aceito (phone_number_id ausente ou null = descoberta); lixo do navegador é descartado", () => {
+  assert.deepEqual(validarPedido({ code: "AQB", waba_id: WABA }), { code: "AQB", wabaId: WABA, phoneNumberId: null });
+  assert.deepEqual(validarPedido({ code: "AQB", waba_id: WABA, phone_number_id: null }), { code: "AQB", wabaId: WABA, phoneNumberId: null });
+  assert.deepEqual(validarPedido({ code: "AQB", waba_id: WABA, business_id: "1", display_phone_number: "+55", user_id: OUTRO }),
+    { code: "AQB", wabaId: WABA, phoneNumberId: null });
+  // presente mas inválido continua 400 (nunca vira "descoberta" por engano)
+  for (const ruim of ["", "12a", 106540352242922, "1".repeat(33), {}]) {
+    assert.equal(validarPedido({ code: "AQB", waba_id: WABA, phone_number_id: ruim }), null, JSON.stringify(ruim));
+  }
+  assert.equal(validarPedido({ code: "AQB" }), null, "waba_id continua obrigatório");
+  assert.equal(validarPedido({ waba_id: WABA }), null, "code continua obrigatório");
+});
+
+test("coexistência: exatamente UM elegível -> descobre o phone_number_id, grava modo 'coexistencia' e termina em 'conectando'", async () => {
+  const { sb, tabelas } = fakeSb();
+  const m = metaCoex({ "999": NAO_ELEGIVEL, [PHONE]: ELEGIVEL });
+  const r = await conectar(sb, m.buscar, PEDIDO_COEX);
+  assert.deepEqual(r, { status: "conectando", waba_id: WABA, phone_number_id: PHONE, display_phone_number: "+55 27 99999-0000", modo_conexao: "coexistencia" });
+
+  const linha = tabelas.integracoes_whatsapp[0];
+  assert.equal(linha.modo_conexao, "coexistencia");
+  assert.equal(linha.status, "conectando");
+  assert.equal(linha.conectado_em, null);
+  assert.equal(linha.waba_id, WABA);
+  assert.equal(linha.phone_number_id, PHONE, "ID vem da descoberta, não do navegador");
+  assert.equal(linha.business_id, null);
+  assert.equal(linha.display_phone_number, "+55 27 99999-0000");
+
+  const segredo = JSON.parse(descriptografarCredencial(tabelas.integracoes_credenciais[0].credencial_cifrada));
+  assert.deepEqual(segredo, { access_token: TOKEN, obtido_em: "2026-09-28T12:00:00.000Z", app_id: APP, waba_id: WABA, phone_number_id: PHONE },
+    "o cofre não carrega marcador de modo");
+  assert.doesNotMatch(JSON.stringify(r), new RegExp(TOKEN));
+
+  // troca -> debug -> lista de números -> uma consulta por candidato; nada de /register nem de histórico
+  assert.deepEqual(m.chamadas.map((c) => c.tipo), ["troca", "debug", "telefones", "numero", "numero"]);
+  const consultas = m.chamadas.filter((c) => c.tipo === "numero");
+  assert.deepEqual(consultas.map((c) => c.url.pathname.split("/").pop()), ["999", PHONE]);
+  for (const c of consultas) {
+    assert.equal(c.url.searchParams.get("fields"), "is_on_biz_app,platform_type");
+    assert.equal(c.auth, `Bearer ${TOKEN}`);
+    assert.equal(c.metodo, "GET");
+  }
+  assert.ok(m.chamadas.every((c) => !proibidos.test(c.url.pathname)), "nenhuma chamada a /register ou /smb_app_data");
+  // troca/debug_token levam code/input_token na URL por desenho da Meta; as demais só por Bearer
+  assert.ok(m.chamadas.filter((c) => c.tipo === "telefones" || c.tipo === "numero")
+    .every((c) => !c.url.href.includes(TOKEN) && !c.url.href.includes(CONFIG.appSecret)));
+});
+
+test("coexistência: mesma ordem de escritas do fluxo padrão (marcador -> cofre -> metadados) e nenhuma escrita depois da Meta antes do fim", async () => {
+  const { sb, ops } = fakeSb();
+  const m = metaCoex({ [PHONE]: ELEGIVEL }, { telefones: listaDe(PHONE) });
+  await conectar(sb, m.buscar, PEDIDO_COEX);
+  assert.deepEqual(ops.filter((o) => o.op !== "select").map((o) => `${o.tabela}.${o.op}`),
+    ["integracoes_whatsapp.upsert", "integracoes_credenciais.upsert", "integracoes_whatsapp.update"]);
+  assert.deepEqual(ops[ops.findIndex((o) => o.op === "upsert")].valores, { user_id: USER, status: "conectando", ultimo_erro: null });
+});
+
+for (const [nome, telefones, mapa] of [
+  ["WABA sem nenhum número", listaDe(), {}],
+  ["número com is_on_biz_app = false", listaDe(PHONE), { [PHONE]: NAO_ELEGIVEL }],
+  ["is_on_biz_app true mas platform_type diferente de CLOUD_API", listaDe(PHONE), { [PHONE]: { is_on_biz_app: true, platform_type: "NOT_APPLICABLE" } }],
+  ["is_on_biz_app true e platform_type ausente", listaDe(PHONE), { [PHONE]: { is_on_biz_app: true } }],
+  ["is_on_biz_app ausente", listaDe(PHONE), { [PHONE]: { platform_type: "CLOUD_API" } }],
+  ["is_on_biz_app como texto 'true' (comparação estrita)", listaDe(PHONE), { [PHONE]: { is_on_biz_app: "true", platform_type: "CLOUD_API" } }],
+  ["vários números, nenhum elegível", listaDe("999", PHONE), { "999": NAO_ELEGIVEL, [PHONE]: NAO_ELEGIVEL }],
+] as const) {
+  test(`coexistência: zero elegíveis (${nome}) -> 422 nenhum_numero_elegivel, cofre e IDs intocados, status 'erro'`, async () => {
+    const { sb, tabelas, ops } = fakeSb();
+    const erro = await falhaCom(conectar(sb, metaCoex(mapa as any, { telefones }).buscar, PEDIDO_COEX));
+    assert.equal(erro.codigo, "nenhum_numero_elegivel");
+    assert.equal(erro.status, 422);
+    assert.ok(!ops.some((o) => o.tabela === "integracoes_credenciais" && o.op !== "select"), "cofre nem foi tocado");
+    assert.equal(tabelas.integracoes_credenciais.length, 0);
+    const linha = tabelas.integracoes_whatsapp[0];
+    assert.equal(linha.status, "erro");
+    assert.equal(linha.ultimo_erro, "nenhum_numero_elegivel");
+    assert.equal(linha.waba_id, null, "ID não verificado nunca é gravado");
+    assert.equal(linha.phone_number_id, null);
+  });
+}
+
+test("coexistência: mais de um elegível -> 422 multiplos_numeros_elegiveis, sem escolher nenhum (nem o mais recente)", async () => {
+  const { sb, tabelas, ops } = fakeSb();
+  const m = metaCoex({ "999": ELEGIVEL, [PHONE]: ELEGIVEL }, { telefones: listaDe("999", PHONE) });
+  const erro = await falhaCom(conectar(sb, m.buscar, PEDIDO_COEX));
+  assert.equal(erro.codigo, "multiplos_numeros_elegiveis");
+  assert.equal(erro.status, 422);
+  assert.ok(!ops.some((o) => o.tabela === "integracoes_credenciais" && o.op !== "select"));
+  assert.equal(tabelas.integracoes_whatsapp[0].phone_number_id, null, "nenhum número foi escolhido");
+  assert.equal(tabelas.integracoes_whatsapp[0].status, "erro");
+});
+
+test("coexistência: para de consultar assim que acha o 2º elegível", async () => {
+  const { sb } = fakeSb();
+  const m = metaCoex({ "1": ELEGIVEL, "2": ELEGIVEL, "3": ELEGIVEL }, { telefones: listaDe("1", "2", "3") });
+  await falhaCom(conectar(sb, m.buscar, PEDIDO_COEX));
+  assert.deepEqual(m.chamadas.filter((c) => c.tipo === "numero").map((c) => c.url.pathname.split("/").pop()), ["1", "2"]);
+});
+
+test("coexistência: falha ao consultar QUALQUER candidato recusa tudo (nunca ignora um número e conclui 'exatamente um')", async () => {
+  const { sb, tabelas } = fakeSb();
+  // 999 falha na consulta (fora do mapa); PHONE seria o único elegível
+  const m = metaCoex({ [PHONE]: ELEGIVEL }, { telefones: listaDe("999", PHONE) });
+  const erro = await falhaCom(conectar(sb, m.buscar, PEDIDO_COEX));
+  assert.equal(erro.codigo, "meta_numero:100");
+  assert.equal(erro.status, 502);
+  assert.equal(tabelas.integracoes_credenciais.length, 0);
+  assert.equal(tabelas.integracoes_whatsapp[0].status, "erro");
+  assert.equal(tabelas.integracoes_whatsapp[0].phone_number_id, null);
+
+  const rede = fakeSb();
+  const e2 = await falhaCom(conectar(rede.sb, metaCoex({ [PHONE]: ELEGIVEL }, { numero: () => "rede", telefones: listaDe(PHONE) }).buscar, PEDIDO_COEX));
+  assert.equal(e2.codigo, "meta_indisponivel");
+});
+
+test("coexistência: listagem de números da WABA recusada pela Meta -> código curto, cofre intocado", async () => {
+  const { sb, tabelas } = fakeSb();
+  const erro = await falhaCom(conectar(sb, metaCoex({}, { telefones: () => OK({ error: { code: 190 } }, 401) }).buscar, PEDIDO_COEX));
+  assert.equal(erro.codigo, "meta_phone_numbers:190");
+  assert.equal(tabelas.integracoes_credenciais.length, 0);
+});
+
+test("coexistência: paginação da lista de números é seguida pelo cursor 'after'", async () => {
+  const { sb, tabelas } = fakeSb();
+  const m = metaCoex({ "999": NAO_ELEGIVEL, [PHONE]: ELEGIVEL }, {
+    telefones: (url) => url.searchParams.get("after") === "CURSOR2"
+      ? OK({ data: [{ id: PHONE, display_phone_number: "+55 27 99999-0000" }], paging: { cursors: { after: "CURSOR3" } } })
+      : OK({ data: [{ id: "999", display_phone_number: "+55" }], paging: { cursors: { after: "CURSOR2" }, next: "https://graph.facebook.com/x?access_token=NAO_USAR" } }),
+  });
+  const r = await conectar(sb, m.buscar, PEDIDO_COEX);
+  assert.equal(r.phone_number_id, PHONE);
+  const paginas = m.chamadas.filter((c) => c.tipo === "telefones");
+  assert.equal(paginas.length, 2);
+  assert.equal(paginas[1].url.searchParams.get("after"), "CURSOR2");
+  assert.ok(m.chamadas.every((c) => !c.url.href.includes("NAO_USAR")), "nunca segue a URL 'next' da Meta (poderia carregar token)");
+  assert.equal(tabelas.integracoes_whatsapp[0].phone_number_id, PHONE);
+});
+
+test("coexistência: WABA com números demais (mais de 25) -> 422 numeros_demais, sem consultar candidatos", async () => {
+  const { sb, tabelas } = fakeSb();
+  const ids = Array.from({ length: 26 }, (_, i) => String(1000 + i));
+  const m = metaCoex({}, { telefones: listaDe(...ids) });
+  const erro = await falhaCom(conectar(sb, m.buscar, PEDIDO_COEX));
+  assert.equal(erro.codigo, "numeros_demais");
+  assert.equal(erro.status, 422);
+  assert.ok(!m.chamadas.some((c) => c.tipo === "numero"));
+  assert.equal(tabelas.integracoes_credenciais.length, 0);
+});
+
+test("coexistência: paginação infinita da Meta é cortada (numeros_demais)", async () => {
+  const { sb } = fakeSb();
+  const m = metaCoex({}, { telefones: () => OK({ data: [], paging: { cursors: { after: "SEMPRE" }, next: "x" } }) });
+  const erro = await falhaCom(conectar(sb, m.buscar, PEDIDO_COEX));
+  assert.equal(erro.codigo, "numeros_demais");
+  assert.equal(m.chamadas.filter((c) => c.tipo === "telefones").length, 5);
+});
+
+test("coexistência: conflito de WABA com OUTRA conta -> 409 antes de qualquer chamada à Meta", async () => {
+  const { sb, tabelas } = fakeSb({ whatsapp: [{ user_id: OUTRO, status: "conectando", waba_id: WABA }] });
+  const m = metaCoex({ [PHONE]: ELEGIVEL });
+  const erro = await falhaCom(conectar(sb, m.buscar, PEDIDO_COEX));
+  assert.equal(erro.codigo, "conflito_outra_conta");
+  assert.equal(erro.status, 409);
+  assert.equal(m.chamadas.length, 0);
+  assert.equal(tabelas.integracoes_whatsapp.find((l) => l.user_id === OUTRO)!.waba_id, WABA, "conta alheia intacta");
+});
+
+test("coexistência: número descoberto já ligado a OUTRA conta -> 409 DEPOIS da descoberta e ANTES de qualquer escrita de cofre/IDs", async () => {
+  const { sb, tabelas, ops } = fakeSb({ whatsapp: [{ user_id: OUTRO, status: "conectado", waba_id: "777000000000001", phone_number_id: PHONE }] });
+  const m = metaCoex({ [PHONE]: ELEGIVEL }, { telefones: listaDe(PHONE) });
+  const erro = await falhaCom(conectar(sb, m.buscar, PEDIDO_COEX));
+  assert.equal(erro.codigo, "conflito_outra_conta");
+  assert.equal(erro.status, 409);
+  // a descoberta aconteceu (o conflito só é conhecido depois dela)...
+  assert.ok(m.chamadas.some((c) => c.tipo === "numero"), "descobriu o número antes de checar o conflito");
+  // ...e nada foi gravado no cofre nem nos IDs
+  assert.ok(!ops.some((o) => o.tabela === "integracoes_credenciais" && o.op !== "select"));
+  assert.equal(tabelas.integracoes_credenciais.length, 0);
+  const minha = tabelas.integracoes_whatsapp.find((l) => l.user_id === USER)!;
+  assert.equal(minha.waba_id, null);
+  assert.equal(minha.phone_number_id, null);
+  assert.equal(minha.status, "erro");
+  const alheia = tabelas.integracoes_whatsapp.find((l) => l.user_id === OUTRO)!;
+  assert.equal(alheia.phone_number_id, PHONE, "conta alheia intacta");
+  assert.equal(alheia.status, "conectado");
+});
+
+test("coexistência: outra conta pega o número durante a descoberta -> ainda 409 antes do cofre", async () => {
+  const { sb, tabelas, ops } = fakeSb();
+  const m = fakeMeta({
+    telefones: listaDe(PHONE),
+    numero: (url) => {
+      tabelas.integracoes_whatsapp.push({ user_id: OUTRO, waba_id: "777000000000001", phone_number_id: PHONE, status: "conectando" });
+      return OK({ id: url.pathname.split("/").pop(), ...ELEGIVEL });
+    },
+  });
+  const erro = await falhaCom(conectar(sb, m.buscar, PEDIDO_COEX));
+  assert.equal(erro.codigo, "conflito_outra_conta");
+  assert.ok(!ops.some((o) => o.tabela === "integracoes_credenciais" && o.op !== "select"));
+});
+
+test("coexistência: corrida pela mesma WABA no UPDATE final (UNIQUE) -> conflito_outra_conta e cofre limpo (compensação preservada)", async () => {
+  const { sb, tabelas } = fakeSb();
+  const m = fakeMeta({
+    telefones: listaDe(PHONE),
+    numero: (url) => {
+      tabelas.integracoes_whatsapp.push({ user_id: OUTRO, waba_id: WABA, phone_number_id: "777", status: "conectando" });
+      return OK({ id: url.pathname.split("/").pop(), ...ELEGIVEL });
+    },
+  });
+  const erro = await falhaCom(conectar(sb, m.buscar, PEDIDO_COEX));
+  assert.equal(erro.codigo, "conflito_outra_conta");
+  assert.equal(erro.status, 409);
+  assert.equal(tabelas.integracoes_credenciais.length, 0, "token recém-gravado foi removido");
+  assert.equal(tabelas.integracoes_whatsapp.find((l) => l.user_id === USER)!.status, "erro");
+});
+
+test("coexistência: compensação -- metadados falham depois do cofre -> cofre limpo (sem credencial anterior)", async () => {
+  const { sb, tabelas, ops } = fakeSb({}, { "integracoes_whatsapp.update": [{ error: { code: "XX000" } }] });
+  const erro = await falhaCom(conectar(sb, metaCoex({ [PHONE]: ELEGIVEL }, { telefones: listaDe(PHONE) }).buscar, PEDIDO_COEX));
+  assert.equal(erro.codigo, "metadados_falhou");
+  assert.ok(ops.some((o) => o.tabela === "integracoes_credenciais" && o.op === "upsert"), "o token chegou a ser gravado");
+  assert.equal(tabelas.integracoes_credenciais.length, 0, "nenhum token órfão");
+  assert.equal(tabelas.integracoes_whatsapp[0].status, "erro");
+});
+
+test("coexistência: compensação com conexão anterior válida -- token ANTIGO restaurado e linha anterior (inclusive o modo) intacta", async () => {
+  const { sb, tabelas, ops } = fakeSb(
+    { whatsapp: [linhaAnterior()], credenciais: [credencialAnterior()] },
+    { "integracoes_whatsapp.update": [{ error: { code: "XX000" } }] },
+  );
+  const erro = await falhaCom(conectar(sb, metaCoex({ [PHONE]: ELEGIVEL }, { telefones: listaDe(PHONE) }).buscar, PEDIDO_COEX));
+  assert.equal(erro.codigo, "metadados_falhou");
+  assert.ok(ops.some((o) => o.tabela === "integracoes_credenciais" && o.op === "upsert"));
+  assert.ok(!ops.some((o) => o.tabela === "integracoes_credenciais" && o.op === "delete"), "com credencial anterior, nunca DELETE");
+  assert.deepEqual(tabelas.integracoes_credenciais, [credencialAnterior()]);
+  assert.deepEqual(tabelas.integracoes_whatsapp, [linhaAnterior()]);
+});
+
+for (const [nome, mapa, codigo] of [
+  ["nenhum elegível", { [PHONE]: NAO_ELEGIVEL, "999": NAO_ELEGIVEL }, "nenhum_numero_elegivel"],
+  ["mais de um elegível", { [PHONE]: ELEGIVEL, "999": ELEGIVEL }, "multiplos_numeros_elegiveis"],
+] as const) {
+  test(`coexistência: falha na descoberta (${nome}) com conexão anterior válida -> cofre e linha anteriores intactos`, async () => {
+    const { sb, tabelas, ops } = fakeSb({ whatsapp: [linhaAnterior()], credenciais: [credencialAnterior()] });
+    const erro = await falhaCom(conectar(sb, metaCoex(mapa as any, { telefones: listaDe(PHONE, "999") }).buscar, PEDIDO_COEX));
+    assert.equal(erro.codigo, codigo);
+    assert.ok(!ops.some((o) => o.tabela === "integracoes_credenciais" && o.op !== "select"), "cofre nem foi tocado");
+    assert.deepEqual(tabelas.integracoes_credenciais, [credencialAnterior()]);
+    assert.deepEqual(tabelas.integracoes_whatsapp, [linhaAnterior()], "conexão anterior preservada (não vira 'erro')");
+  });
+}
+
+test("coexistência: falha de token/WABA (debug_token) segue a mesma validação e recusa antes da descoberta", async () => {
+  const { sb, tabelas } = fakeSb();
+  const m = metaCoex({ [PHONE]: ELEGIVEL }, { debug: () => OK({ data: { is_valid: true, app_id: APP, granular_scopes: escopos(["555"], ["555"]) } }) });
+  const erro = await falhaCom(conectar(sb, m.buscar, PEDIDO_COEX));
+  assert.equal(erro.codigo, "waba_nao_autorizada");
+  assert.ok(!m.chamadas.some((c) => c.tipo === "telefones" || c.tipo === "numero"), "nada é descoberto com token que não alcança a WABA");
+  assert.equal(tabelas.integracoes_credenciais.length, 0);
+});
+
+test("fluxo padrão sem regressão: com phone_number_id NÃO usa a descoberta (nenhuma consulta is_on_biz_app) e mantém o modo 'padrao'", async () => {
+  const { sb, tabelas } = fakeSb();
+  const m = fakeMeta();
+  const r = await conectar(sb, m.buscar);
+  assert.equal(r.modo_conexao, "padrao");
+  assert.deepEqual(m.chamadas.map((c) => c.tipo), ["troca", "debug", "telefones"]);
+  assert.ok(m.chamadas.every((c) => !c.url.searchParams.get("fields")?.includes("is_on_biz_app")));
+  assert.equal(tabelas.integracoes_whatsapp[0].modo_conexao, "padrao");
+});
+
+test("fluxo padrão sem regressão: reconectar em modo padrão sobre uma linha de coexistência volta o modo para 'padrao' (e vice-versa)", async () => {
+  const a = fakeSb({ whatsapp: [linhaCoex({ status: "conectado", conectado_em: "2026-09-27T00:00:00Z" })], credenciais: [credencialReal()] });
+  await conectar(a.sb, fakeMeta().buscar);
+  assert.equal(a.tabelas.integracoes_whatsapp[0].modo_conexao, "padrao");
+  assert.equal(a.tabelas.integracoes_whatsapp[0].status, "conectando");
+
+  const b = fakeSb({ whatsapp: [linhaAnterior()], credenciais: [credencialReal()] });
+  await conectar(b.sb, metaCoex({ [PHONE]: ELEGIVEL }, { telefones: listaDe(PHONE) }).buscar, PEDIDO_COEX);
+  assert.equal(b.tabelas.integracoes_whatsapp[0].modo_conexao, "coexistencia");
+});
+
+test("estado: expõe o modo da conexão e continua sem devolver token", async () => {
+  const { sb } = fakeSb();
+  await conectar(sb, metaCoex({ [PHONE]: ELEGIVEL }, { telefones: listaDe(PHONE) }).buscar, PEDIDO_COEX);
+  const estado = await estadoWhatsapp(sb, USER);
+  assert.equal(estado.modo_conexao, "coexistencia");
+  assert.equal(estado.conectado, false);
+  assert.doesNotMatch(JSON.stringify(estado), new RegExp(TOKEN));
+});
+
+// ── ativação em Coexistência ────────────────────────────────────────────────
+
+test("ativação coexistência: SEM PIN -> inscreve, confirma, valida is_on_biz_app/CLOUD_API e promove; /register nunca é chamado", async () => {
+  const { sb, tabelas } = fakeSb({ whatsapp: [linhaCoex()], credenciais: [credencialReal()] });
+  const m = fakeMeta({ numero: numeroCoex({ [PHONE]: ELEGIVEL }) });
+  const r = await ativar(sb, m.buscar);
+  assert.deepEqual(r, { status: "conectado", modo_conexao: "coexistencia", waba_id: WABA, phone_number_id: PHONE,
+    webhook_inscrito_em: "2026-09-28T12:00:00.000Z", conectado_em: "2026-09-28T12:00:00.000Z" });
+  assert.deepEqual(m.chamadas.map((c) => c.tipo), ["debug", "inscrever", "inscricao", "numero"], "subscribed_apps mantido, sem /register");
+  const consulta = m.chamadas.find((c) => c.tipo === "numero")!;
+  assert.equal(consulta.url.searchParams.get("fields"), "is_on_biz_app,platform_type");
+  assert.equal(consulta.auth, `Bearer ${TOKEN}`);
+  assert.equal(m.chamadas.find((c) => c.tipo === "inscrever")!.metodo, "POST");
+  assert.equal(m.chamadas.find((c) => c.tipo === "inscrever")!.corpo, null, "inscrição sem campos extras (nada de history)");
+  assert.ok(m.chamadas.every((c) => !proibidos.test(c.url.pathname)));
+  const linha = tabelas.integracoes_whatsapp[0];
+  assert.equal(linha.status, "conectado");
+  assert.equal(linha.modo_conexao, "coexistencia");
+  assert.equal(linha.conectado_em, "2026-09-28T12:00:00.000Z");
+  assert.equal(linha.webhook_inscrito_em, "2026-09-28T12:00:00.000Z");
+  assert.equal(linha.ultimo_erro, null);
+  assert.equal((await estadoWhatsapp(sb, USER)).conectado, true);
+});
+
+test("ativação coexistência: status do número NÃO é exigido (só is_on_biz_app + CLOUD_API) e o status nem é consultado", async () => {
+  const { sb } = fakeSb({ whatsapp: [linhaCoex()], credenciais: [credencialReal()] });
+  const m = fakeMeta({ numero: (url) => OK({ id: PHONE, status: "PENDING", ...ELEGIVEL, fields: url.searchParams.get("fields") }) });
+  assert.equal((await ativar(sb, m.buscar)).status, "conectado");
+  assert.ok(m.chamadas.filter((c) => c.tipo === "numero").every((c) => c.url.searchParams.get("fields") === "is_on_biz_app,platform_type"));
+});
+
+test("ativação coexistência: PIN enviado por engano é ignorado -- /register continua sem ser chamado e o PIN não vai a lugar nenhum", async () => {
+  const { sb, tabelas, ops } = fakeSb({ whatsapp: [linhaCoex()], credenciais: [credencialReal()] });
+  const m = fakeMeta({ numero: numeroCoex({ [PHONE]: ELEGIVEL }) });
+  const r = await ativar(sb, m.buscar, PIN);
+  assert.equal(r.status, "conectado");
+  assert.ok(!m.chamadas.some((c) => c.tipo === "registro"));
+  assert.ok(m.chamadas.every((c) => c.corpo === null && !c.url.href.includes(PIN)));
+  assert.doesNotMatch(JSON.stringify(ops) + JSON.stringify(tabelas) + JSON.stringify(r), new RegExp(PIN));
+});
+
+for (const [nome, dados] of [
+  ["is_on_biz_app false", { is_on_biz_app: false, platform_type: "CLOUD_API" }],
+  ["platform_type diferente de CLOUD_API", { is_on_biz_app: true, platform_type: "NOT_APPLICABLE" }],
+  ["platform_type ausente", { is_on_biz_app: true }],
+  ["is_on_biz_app ausente", { platform_type: "CLOUD_API" }],
+  ["número sem nenhum dos dois campos", { status: "CONNECTED" }],
+] as const) {
+  test(`ativação coexistência: não pronto (${nome}) -> 409 tentável (numero_coexistencia_nao_pronto), sem /register e sem pin_necessario`, async () => {
+    for (const pin of [null, PIN]) {
+      const { sb, tabelas } = fakeSb({ whatsapp: [linhaCoex()], credenciais: [credencialReal()] });
+      const m = fakeMeta({ numero: () => OK({ id: PHONE, ...dados }) });
+      const erro = await falhaCom(ativar(sb, m.buscar, pin));
+      assert.equal(erro.codigo, "numero_coexistencia_nao_pronto");
+      assert.equal(erro.status, 409);
+      assert.notEqual(erro.codigo, "pin_necessario");
+      assert.ok(!m.chamadas.some((c) => c.tipo === "registro"), "nunca /register, com ou sem PIN");
+      const linha = tabelas.integracoes_whatsapp[0];
+      assert.equal(linha.status, "conectando", "não promove");
+      assert.equal(linha.conectado_em, null);
+      assert.equal(linha.ultimo_erro, null, "pedido de espera não é gravado como erro (nem pin_necessario)");
+      assert.equal(linha.webhook_inscrito_em, "2026-09-28T12:00:00.000Z", "a inscrição já confirmada fica gravada");
+      assert.equal(linha.registro_ultima_falha_em, null, "relógio do /register nunca é ligado em coexistência");
+    }
+  });
+}
+
+test("ativação coexistência: 'não pronto' é tentável -- a chamada seguinte, com o número pronto, promove (sem PIN)", async () => {
+  const { sb, tabelas } = fakeSb({ whatsapp: [linhaCoex()], credenciais: [credencialReal()] });
+  const m = fakeMeta({ numero: seq(OK({ id: PHONE, ...NAO_ELEGIVEL }), OK({ id: PHONE, ...ELEGIVEL })) });
+  assert.equal((await falhaCom(ativar(sb, m.buscar))).codigo, "numero_coexistencia_nao_pronto");
+  assert.equal((await ativar(sb, m.buscar)).status, "conectado");
+  assert.equal(tabelas.integracoes_whatsapp[0].status, "conectado");
+  assert.ok(!m.chamadas.some((c) => c.tipo === "registro"));
+});
+
+test("ativação coexistência: erro da Meta ao consultar o número -> 502 registrado em ultimo_erro, continua 'conectando', sem /register", async () => {
+  const { sb, tabelas } = fakeSb({ whatsapp: [linhaCoex()], credenciais: [credencialReal()] });
+  const m = fakeMeta({ numero: () => OK({ error: { code: 190 } }, 401) });
+  const erro = await falhaCom(ativar(sb, m.buscar, PIN));
+  assert.equal(erro.codigo, "meta_numero:190");
+  assert.equal(erro.status, 502);
+  assert.equal(tabelas.integracoes_whatsapp[0].status, "conectando");
+  assert.equal(tabelas.integracoes_whatsapp[0].ultimo_erro, "meta_numero:190");
+  assert.ok(!m.chamadas.some((c) => c.tipo === "registro"));
+});
+
+for (const [nome, extra] of [
+  ["inscrição sem success", { inscrever: () => OK({ success: false }) }],
+  ["nosso app ausente da lista de inscritos", { inscricao: () => OK({ data: [{ whatsapp_business_api_data: { id: "999" } }] }) }],
+] as const) {
+  test(`ativação coexistência: ${nome} -> falha e NÃO consulta nem promove o número (subscribed_apps + confirmação continuam obrigatórios)`, async () => {
+    const { sb, tabelas } = fakeSb({ whatsapp: [linhaCoex()], credenciais: [credencialReal()] });
+    const m = fakeMeta({ numero: numeroCoex({ [PHONE]: ELEGIVEL }), ...extra });
+    const erro = await falhaCom(ativar(sb, m.buscar));
+    assert.equal(erro.status, 502);
+    assert.ok(!m.chamadas.some((c) => c.tipo === "numero" || c.tipo === "registro"));
+    assert.equal(tabelas.integracoes_whatsapp[0].status, "conectando");
+    assert.equal(tabelas.integracoes_whatsapp[0].webhook_inscrito_em, null);
+  });
+}
+
+test("ativação coexistência: reconexão no meio (modo trocado) -> estado_alterado; nada promovido nem gravado sobre a conexão nova", async () => {
+  const { sb, tabelas } = fakeSb({ whatsapp: [linhaCoex()], credenciais: [credencialReal()] });
+  const m = fakeMeta({
+    numero: (url) => {
+      Object.assign(tabelas.integracoes_whatsapp[0], { modo_conexao: "padrao", webhook_inscrito_em: null, ultimo_erro: null });
+      return OK({ id: url.pathname.split("/").pop(), ...ELEGIVEL });
+    },
+  });
+  const erro = await falhaCom(ativar(sb, m.buscar));
+  assert.equal(erro.codigo, "estado_alterado");
+  assert.equal(tabelas.integracoes_whatsapp[0].status, "conectando");
+  assert.equal(tabelas.integracoes_whatsapp[0].modo_conexao, "padrao");
+});
+
+for (const [nome, modo] of [["desconhecido", "outro"], ["nulo", null], ["ausente", undefined]] as const) {
+  test(`ativação: modo_conexao ${nome} -> 409 estado_invalido, sem Meta e sem escrita (fail-closed: nunca cai no caminho do /register)`, async () => {
+    const { sb, tabelas, ops } = fakeSb({ whatsapp: [{ ...linhaConectando(), modo_conexao: modo }], credenciais: [credencialReal()] });
+    const m = fakeMeta({ numero: () => PENDENTE });
+    const erro = await falhaCom(ativar(sb, m.buscar, PIN));
+    assert.equal(erro.codigo, "estado_invalido");
+    assert.equal(erro.status, 409);
+    assert.equal(m.chamadas.length, 0);
+    assert.ok(!ops.some((o) => o.op !== "select"));
+    assert.equal(tabelas.integracoes_whatsapp[0].status, "conectando");
+  });
+}
+
+test("fluxo padrão sem regressão na ativação: modo 'padrao' continua pedindo PIN e registrando quando o número não está CONNECTED", async () => {
+  const semPin = fakeSb({ whatsapp: [linhaConectando()], credenciais: [credencialReal()] });
+  const m1 = fakeMeta({ numero: () => PENDENTE });
+  assert.equal((await falhaCom(ativar(semPin.sb, m1.buscar))).codigo, "pin_necessario");
+  assert.ok(!m1.chamadas.some((c) => c.tipo === "registro"));
+
+  const comPin = fakeSb({ whatsapp: [linhaConectando()], credenciais: [credencialReal()] });
+  const m2 = fakeMeta({ numero: seq(PENDENTE, OK({ status: "CONNECTED", id: PHONE })) });
+  assert.equal((await ativar(comPin.sb, m2.buscar, PIN)).status, "conectado");
+  assert.deepEqual(m2.chamadas.map((c) => c.tipo), ["debug", "inscrever", "inscricao", "numero", "registro", "numero"]);
+  assert.equal(m2.chamadas.filter((c) => c.tipo === "numero").every((c) => c.url.searchParams.get("fields") === "status"), true);
+});
+
+test("ponta a ponta (coexistência): conexão descobre o número, ativação promove -- sem PIN, sem /register, sem histórico", async () => {
+  const { sb, tabelas } = fakeSb();
+  const m = metaCoex({ "999": NAO_ELEGIVEL, [PHONE]: ELEGIVEL });
+  const c = await conectar(sb, m.buscar, PEDIDO_COEX);
+  assert.equal(c.status, "conectando");
+  assert.equal(c.modo_conexao, "coexistencia");
+  const a = await ativar(sb, m.buscar);
+  assert.equal(a.status, "conectado");
+  assert.equal(a.phone_number_id, PHONE);
+  assert.equal(tabelas.integracoes_whatsapp[0].modo_conexao, "coexistencia");
+  assert.equal((await estadoWhatsapp(sb, USER)).conectado, true);
+  assert.ok(!m.chamadas.some((x) => x.tipo === "registro"));
+  assert.ok(m.chamadas.every((x) => !proibidos.test(x.url.pathname) && x.corpo === null));
+});
+
+// ── proteções de fonte (o que os testes de comportamento não conseguem provar sozinhos) ──
+
+test("fonte: /register só é alcançável no ramo 'padrao'; o ramo de coexistência não cita registro nem PIN", () => {
+  const codigo = src.replace(/(^|\s)\/\/[^\n]*/g, "$1");
+  const ativacao = codigo.slice(codigo.indexOf("export async function ativarWhatsapp"));
+  assert.equal((ativacao.match(/registrarNumero\(/g) || []).length, 1, "uma única chamada ao registro");
+  const ramoCoex = ativacao.slice(ativacao.indexOf('if (modo === "coexistencia")'), ativacao.indexOf("} else {"));
+  assert.ok(ramoCoex.length > 0);
+  assert.doesNotMatch(ramoCoex, /registrarNumero|register|pin/i);
+  assert.ok(ativacao.indexOf("registrarNumero(") > ativacao.indexOf("} else {"), "o registro está no else do ramo de coexistência");
+  assert.match(ativacao, /linha\.modo_conexao !== "padrao" && linha\.modo_conexao !== "coexistencia"/, "modo desconhecido é recusado antes de tudo");
+  // registrarNumero é o único ponto que fala com /register
+  assert.equal((codigo.match(/\/register/g) || []).length, 1);
+});
+
+test("fonte: sem sincronização de histórico -- nenhum /smb_app_data, sync_type, history nem campos de webhook novos na lib", () => {
+  const codigo = src.replace(/(^|\s)\/\/[^\n]*/g, "$1");
+  assert.doesNotMatch(codigo, /smb_app_data|sync_type|history|smb_app_state_sync|smb_message_echoes/i);
+  // subscribed_apps continua sem corpo (nada de campos/override de callback)
+  assert.match(codigo, /chamarGraph\(buscar, url, accessToken, \{ metodo: "POST" \}\)/);
+  const webhook = readFileSync(new URL("./metaWebhook.ts", import.meta.url), "utf8");
+  assert.match(webhook, /export const CAMPO_PROCESSADO = "messages";/, "webhook segue processando só 'messages'");
+});
+
+test("fonte: a compensação restaura o modo anterior; a rota devolve os códigos controlados da descoberta (422) sem confundir com conflito (409)", () => {
+  const codigo = src.replace(/(^|\s)\/\/[^\n]*/g, "$1");
+  assert.match(codigo, /modo_conexao: anterior!\.modo_conexao/);
+  assert.match(codigo, /modo_conexao: modo,\s*status: "conectando"/);
+  assert.match(rota, /falha\.status === 409\) return responder\(req, \{ ok: false, erro: "conflito_outra_conta" \}, 409\);/);
+  assert.match(rota, /falha\.status === 422\) return responder\(req, \{ ok: false, erro: falha\.codigo \}, 422\);/);
+  const ativacao = readFileSync(new URL("../../app/api/whatsapp/ativacao/route.ts", import.meta.url), "utf8");
+  assert.match(ativacao, /falha\.status === 409 \|\| falha\.status === 429\) return responder\(req, \{ ok: false, erro: falha\.codigo \}, falha\.status\)/,
+    "numero_coexistencia_nao_pronto (409) chega ao cliente com o código");
 });
