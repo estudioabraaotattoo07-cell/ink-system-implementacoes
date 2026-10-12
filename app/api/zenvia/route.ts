@@ -13,10 +13,8 @@ export async function POST(req: NextRequest) {
   if (!auth.ok) return responder(req, { error: "Não autenticado" }, 401);
   if (auth.tipo === "user" && !origemPermitida(req)) return responder(req, { error: "Acesso não permitido" }, 403);
   if (excedeuLimite(`zenvia:${auth.identificador}`, 30)) return responder(req, { error: "Muitas solicitações. Aguarde um minuto." }, 429);
-  // SMS foi extinto no INK SYSTEM: este endpoint só envia WhatsApp. Um pedido de SMS é
-  // recusado aqui, antes de qualquer credencial ser lida e sem nenhuma chamada à Zenvia.
+  // Este endpoint só envia WhatsApp: qualquer outro canal é recusado antes de ler credenciais.
   const body = await req.json().catch(() => ({})); const { to, text, canal } = body;
-  if (canal === "sms") return responder(req, { error: "O canal SMS foi descontinuado e não envia mais mensagens." }, 410);
   if (!to || !text || canal !== "whatsapp") return responder(req, { error: "Mensagem inválida." }, 400);
   const sb = createAdminClient();
   if (auth.tipo === "user" && !(await usuarioTemAcessoCrm(sb, auth))) return responder(req, { error: "Acesso não permitido" }, 403);

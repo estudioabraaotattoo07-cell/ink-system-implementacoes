@@ -1,12 +1,11 @@
-// lib/integracoes/zenviaSemSms.test.ts
+// lib/integracoes/zenviaSoWhatsapp.test.ts
 //
-// SMS foi extinto no INK SYSTEM. Executa o POST REAL de /api/zenvia com o
-// fetch global falso: um pedido de SMS é recusado explicitamente (410) sem
-// nenhuma chamada à Zenvia; o WhatsApp continua indo para o endpoint de
-// WhatsApp.
+// Executa o POST REAL de /api/zenvia com o fetch global falso: o endpoint só
+// envia WhatsApp. Qualquer outro canal é inválido (400) e não gera nenhuma
+// chamada à Zenvia.
 //
 // Rodar com:
-//   node --import ./scripts/_harness/register-hook.mjs --test lib/integracoes/zenviaSemSms.test.ts
+//   node --import ./scripts/_harness/register-hook.mjs --test lib/integracoes/zenviaSoWhatsapp.test.ts
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -35,24 +34,16 @@ function pedido(corpo: unknown) {
   });
 }
 
-test("pedido de SMS é recusado com 410 e nenhuma chamada sai para a Zenvia", async () => {
+test("canal diferente de whatsapp é inválido (400) e nenhuma chamada sai para a Zenvia", async () => {
   chamadas.length = 0;
-  const resposta = await POST(pedido({ to: "27999990000", text: "oi", canal: "sms" }));
-  assert.equal(resposta.status, 410);
-  assert.match((await resposta.json()).error, /SMS foi descontinuado/);
-  assert.equal(chamadas.length, 0);
-});
-
-test("canal ausente ou desconhecido é inválido (400), sem chamada à Zenvia", async () => {
-  chamadas.length = 0;
-  for (const canal of [undefined, "email", "ambos", "SMS"]) {
+  for (const canal of [undefined, "", "email", "ambos", "WHATSAPP", "outro"]) {
     const resposta = await POST(pedido({ to: "27999990000", text: "oi", canal }));
     assert.equal(resposta.status, 400, String(canal));
   }
   assert.equal(chamadas.length, 0);
 });
 
-test("WhatsApp continua enviando, só para o endpoint de WhatsApp da Zenvia", async () => {
+test("WhatsApp envia, só para o endpoint de WhatsApp da Zenvia", async () => {
   chamadas.length = 0;
   const resposta = await POST(pedido({ to: "27999990000", text: "oi", canal: "whatsapp" }));
   assert.equal(resposta.status, 200);
@@ -61,7 +52,7 @@ test("WhatsApp continua enviando, só para o endpoint de WhatsApp da Zenvia", as
   assert.deepEqual(chamadas[0].corpo, { from: "remetente-teste", to: "5527999990000", contents: [{ type: "text", text: "oi" }] });
 });
 
-test("a rota não conhece mais o endpoint de SMS da Zenvia", () => {
+test("a rota tem um único endpoint da Zenvia, o de WhatsApp", () => {
   const rota = readFileSync(new URL("../../app/api/zenvia/route.ts", import.meta.url), "utf8");
-  assert.doesNotMatch(rota, /channels\/sms/);
+  assert.deepEqual(rota.match(/https:\/\/api\.zenvia\.com[^"]*/g), ["https://api.zenvia.com/v2/channels/whatsapp/messages"]);
 });
